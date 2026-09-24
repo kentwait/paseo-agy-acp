@@ -5,7 +5,9 @@
  */
 export interface AgyAdmissionDispatchBoundary {
   prepare(processId: number): void;
+  commitDispatchIntent(): void;
   beforePromptWrite(): void;
+  markDispatchAmbiguous(): void;
   afterPromptWrite(): void;
 }
 
