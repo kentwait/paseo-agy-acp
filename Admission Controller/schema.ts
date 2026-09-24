@@ -1,7 +1,11 @@
 import type Database from "better-sqlite3";
+import {
+  isProcessEvidencePlatform,
+  parseProcessIdentityEnvelope
+} from "./process-evidence.js";
 
 /** The newest AdmissionController schema this connector can safely use. */
-export const ADMISSION_SCHEMA_VERSION = 3;
+export const ADMISSION_SCHEMA_VERSION = 4;
 
 /** Raised when an admission database is not exactly the supported schema. */
 export class SchemaIntegrityError extends Error {
@@ -47,6 +51,7 @@ interface TableSpec {
   namedIndexes: readonly IndexSpec[];
   uniqueConstraints: readonly (readonly string[])[];
   requiredSqlFragments?: readonly string[];
+  requiredIndexSqlFragments?: Readonly<Record<string, readonly string[]>>;
 }
 
 interface MigrationSpec {
@@ -102,7 +107,8 @@ interface MigrationRow {
 const MIGRATIONS: readonly MigrationSpec[] = [
   { version: 1, name: "shared-admission-queue" },
   { version: 2, name: "shared-admission-queue-v2" },
-  { version: 3, name: "shared-admission-queue-v3" }
+  { version: 3, name: "shared-admission-queue-v3" },
+  { version: 4, name: "shared-admission-queue-v4" }
 ];
 
 const TABLES: readonly TableSpec[] = [
@@ -139,7 +145,13 @@ const TABLES: readonly TableSpec[] = [
       index("turn_requests_queue", ["state", "enqueued_at"]),
       index("turn_requests_queued_owner", ["queued_owner_instance_id"], [], false, true)
     ],
-    uniqueConstraints: []
+    uniqueConstraints: [],
+    requiredIndexSqlFragments: {
+      turn_requests_queued_owner: [
+        "turn_requests_queued_owner ON turn_requests(queued_owner_instance_id)",
+        "queued_owner_instance_id IS NOT NULL"
+      ]
+    }
   },
   {
     name: "leases",
@@ -199,20 +211,8 @@ const TABLES: readonly TableSpec[] = [
       column("prompt_channel", "TEXT", true),
       column("connector_owner_instance_id", "TEXT", true),
       column("connector_created_at", "TEXT", true),
-      column("connector_boot_id", "TEXT", true),
-      column("connector_pid", "INTEGER", true),
-      column("connector_start_time_ticks", "TEXT", true),
-      column("connector_pid_namespace_inode", "INTEGER", true),
-      column("connector_ppid", "INTEGER", true),
-      column("connector_pgrp", "INTEGER", true),
-      column("connector_session", "INTEGER", true),
-      column("child_boot_id", "TEXT", true),
-      column("child_pid", "INTEGER", true),
-      column("child_start_time_ticks", "TEXT", true),
-      column("child_pid_namespace_inode", "INTEGER", true),
-      column("child_ppid", "INTEGER", true),
-      column("child_pgrp", "INTEGER", true),
-      column("child_session", "INTEGER", true),
+      column("connector_evidence_json", "TEXT", true),
+      column("child_evidence_json", "TEXT", true),
       column("recorded_at", "INTEGER", true)
     ],
     foreignKeys: [
@@ -220,7 +220,11 @@ const TABLES: readonly TableSpec[] = [
       foreignKey("request_id", "turn_requests", "request_id")
     ],
     namedIndexes: [index("lease_process_identities_request", ["request_id"], [], true)],
-    uniqueConstraints: []
+    uniqueConstraints: [],
+    requiredSqlFragments: [
+      "connector_evidence_json TEXT NOT NULL CHECK (json_valid(connector_evidence_json))",
+      "child_evidence_json TEXT NOT NULL CHECK (json_valid(child_evidence_json))"
+    ]
   },
   {
     name: "start_history",
@@ -241,7 +245,8 @@ const TABLES: readonly TableSpec[] = [
       column("drain_state", "TEXT", true),
       column("policy_fingerprint", "TEXT", true),
       column("updated_at", "INTEGER", true),
-      column("updated_by_owner_instance_id", "TEXT", true)
+      column("updated_by_owner_instance_id", "TEXT", true),
+      column("process_evidence_platform", "TEXT", true)
     ],
     foreignKeys: [],
     namedIndexes: [],
@@ -253,7 +258,8 @@ const TABLES: readonly TableSpec[] = [
       "min_start_interval_ms INTEGER NOT NULL CHECK (min_start_interval_ms >= 2000)",
       "queue_timeout_ms INTEGER NOT NULL CHECK (queue_timeout_ms > 0 AND queue_timeout_ms <= 1800000)",
       "capacity_cooldown_ms INTEGER NOT NULL CHECK (capacity_cooldown_ms >= 30000)",
-      "drain_state TEXT NOT NULL CHECK (drain_state IN ('steady', 'soft_draining_to_1'))"
+      "drain_state TEXT NOT NULL CHECK (drain_state IN ('steady', 'soft_draining_to_1'))",
+      "process_evidence_platform TEXT NOT NULL CHECK (process_evidence_platform IN ('linux', 'darwin'))"
     ]
   },
   {
@@ -261,18 +267,13 @@ const TABLES: readonly TableSpec[] = [
     columns: [
       column("owner_instance_id", "TEXT", false, 1),
       column("created_at", "TEXT", true),
-      column("boot_id", "TEXT", true),
-      column("pid", "INTEGER", true),
-      column("start_time_ticks", "TEXT", true),
-      column("pid_namespace_inode", "INTEGER", true),
-      column("ppid", "INTEGER", true),
-      column("pgrp", "INTEGER", true),
-      column("session", "INTEGER", true),
+      column("queued_owner_evidence_json", "TEXT", true),
       column("recorded_at", "INTEGER", true)
     ],
     foreignKeys: [],
     namedIndexes: [],
-    uniqueConstraints: []
+    uniqueConstraints: [],
+    requiredSqlFragments: ["queued_owner_evidence_json TEXT NOT NULL CHECK (json_valid(queued_owner_evidence_json))"]
   },
   {
     name: "sessions",
@@ -329,6 +330,7 @@ export function assertAdmissionSchemaIntegrity(db: Database.Database): void {
       assertIndexes(db, table);
     }
 
+    assertCanonicalEvidence(db);
     assertMigrationLedger(db);
   } catch (error) {
     if (error instanceof SchemaIntegrityError) throw error;
@@ -461,6 +463,21 @@ function assertIndexes(db: Database.Database, expected: TableSpec): void {
     assertIndexColumns(db, expected.name, required.name, required.columns);
   }
 
+  for (const [indexName, fragments] of Object.entries(expected.requiredIndexSqlFragments ?? {})) {
+    const row = db
+      .prepare("SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?")
+      .get(indexName) as { sql?: unknown } | undefined;
+    if (typeof row?.sql !== "string") {
+      fail(`table ${expected.name} index ${indexName} definition could not be inspected`);
+    }
+    const normalized = row.sql.replace(/\s+/g, " ").trim().toUpperCase();
+    for (const fragment of fragments) {
+      if (!normalized.includes(fragment.replace(/\s+/g, " ").trim().toUpperCase())) {
+        fail(`table ${expected.name} index ${indexName} definition does not match the schema contract`);
+      }
+    }
+  }
+
   const uniqueConstraints = allIndexes.filter((entry) => entry.origin === "u");
   if (uniqueConstraints.length !== expected.uniqueConstraints.length) {
     fail(`table ${expected.name} unique constraints do not match the schema contract`);
@@ -511,6 +528,44 @@ function indexHasColumns(db: Database.Database, indexName: string, requiredColum
   );
 }
 
+function assertCanonicalEvidence(db: Database.Database): void {
+  const policyRows = db.prepare("SELECT process_evidence_platform FROM policy_state").all() as Array<{
+    process_evidence_platform: unknown;
+  }>;
+  if (policyRows.length > 1) fail("policy state contains multiple platform bindings");
+  const policyPlatform = policyRows[0]?.process_evidence_platform;
+  if (policyPlatform !== undefined && !isProcessEvidencePlatform(policyPlatform)) {
+    fail("policy process evidence platform is invalid");
+  }
+
+  let evidencePlatform: string | undefined = typeof policyPlatform === "string" ? policyPlatform : undefined;
+  const dispatchRows = db
+    .prepare("SELECT connector_evidence_json, child_evidence_json FROM lease_process_identities")
+    .all() as Array<{ connector_evidence_json: unknown; child_evidence_json: unknown }>;
+  for (const row of dispatchRows) {
+    const connector = parseProcessIdentityEnvelope(row.connector_evidence_json);
+    const child = parseProcessIdentityEnvelope(row.child_evidence_json);
+    if (connector === null || child === null) fail("lease process evidence is not canonical JSON");
+    if (connector.platform !== child.platform) fail("lease process evidence platform does not match its counterpart");
+    if (evidencePlatform !== undefined && connector.platform !== evidencePlatform) {
+      fail("lease process evidence platform does not match policy state");
+    }
+    evidencePlatform = connector.platform;
+  }
+
+  const ownerRows = db
+    .prepare("SELECT queued_owner_evidence_json FROM queued_owner_instances")
+    .all() as Array<{ queued_owner_evidence_json: unknown }>;
+  for (const row of ownerRows) {
+    const owner = parseProcessIdentityEnvelope(row.queued_owner_evidence_json);
+    if (owner === null) fail("queued-owner process evidence is not canonical JSON");
+    if (evidencePlatform !== undefined && owner.platform !== evidencePlatform) {
+      fail("queued-owner process evidence platform does not match policy state");
+    }
+    evidencePlatform = owner.platform;
+  }
+}
+
 function assertMigrationLedger(db: Database.Database): void {
   const rows = db
     .prepare("SELECT version, name FROM schema_migrations ORDER BY version ASC")
@@ -524,17 +579,21 @@ function assertMigrationLedger(db: Database.Database): void {
     byVersion.set(version, row);
   }
 
+  const versions = [...byVersion.keys()].sort((left, right) => left - right);
+  const freshV4 = versions.length === 1 && versions[0] === 4;
+  const complete = versions.length === MIGRATIONS.length && versions.every((version, index) => version === MIGRATIONS[index]?.version);
+  if (!freshV4 && !complete) {
+    const unexpected = versions.find((version) => !MIGRATIONS.some((expected) => expected.version === version));
+    fail(`migration ledger has unexpected version ${unexpected ?? "unknown"}`);
+  }
+
   for (const expected of MIGRATIONS) {
+    if (freshV4 && expected.version !== 4) continue;
     const found = byVersion.get(expected.version);
     if (found === undefined) fail(`migration ledger is missing version ${expected.version}`);
     if (found.name !== expected.name) {
       fail(`migration ${expected.version} must be named ${expected.name}`);
     }
-  }
-
-  if (byVersion.size !== MIGRATIONS.length) {
-    const unexpected = [...byVersion.keys()].find((version) => !MIGRATIONS.some((expected) => expected.version === version));
-    fail(`migration ledger has unexpected version ${unexpected ?? "unknown"}`);
   }
 }
 

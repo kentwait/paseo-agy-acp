@@ -45,6 +45,9 @@ export class AdmissionRuntime {
   constructor(controller: AdmissionController, options: AdmissionRuntimeOptions = {}) {
     this.#controller = controller;
     this.#processEvidence = requireProcessEvidence(options.processEvidence ?? controller.processEvidence);
+    if (this.#processEvidence.platform !== controller.processEvidence.platform) {
+      throw new AdmissionRuntimeError("process evidence platform does not match durable admission platform");
+    }
     this.#readNow = options.now ?? Date.now;
     const intervalMs = normalizeReaperIntervalMs(options.reaperIntervalMs);
     this.#reaperTimer = setInterval(() => this.reapOnce(), intervalMs);
