@@ -8,11 +8,12 @@ import {
   type AdmissionLease,
   type AdmissionPolicy
 } from "../Admission Controller/controller.js";
-import type { LinuxProcessIdentity } from "../Admission Controller/process-evidence.js";
 import {
-  recoverExitedAdmissionSeats,
-  type AdmissionStartupRecoveryReaders
-} from "../ACP Connector/admission/startup-recovery.js";
+  createLinuxProcessEvidence,
+  type LinuxProcessIdentity,
+  type ProcessEvidence
+} from "../Admission Controller/process-evidence.js";
+import { recoverExitedAdmissionSeats } from "../ACP Connector/admission/startup-recovery.js";
 
 const BOOT_ID = "f4bca3da-9bd5-4f2e-89b8-5e12e5ee8f31";
 const NAMESPACE_INODE = 4_026_531_836;
@@ -91,29 +92,31 @@ function dispatch(admission: AdmissionController): AdmissionLease {
   return lease;
 }
 
-function readers(options: {
+function processEvidence(options: {
   connector: "same" | "gone" | "unverifiable";
   child: "same" | "gone" | "unverifiable";
   processIds?: readonly number[];
   listUnavailable?: boolean;
-}): AdmissionStartupRecoveryReaders {
-  return {
+}): ProcessEvidence {
+  return createLinuxProcessEvidence({
     listProcessIds() {
       if (options.listUnavailable) throw new Error("process inventory unavailable");
       return options.processIds ?? [];
     },
-    readFile(filePath) {
-      if (filePath === "/proc/sys/kernel/random/boot_id") return `${BOOT_ID}\n`;
-      if (filePath === `/proc/${CONNECTOR.pid}/stat`) return processStat(CONNECTOR, options.connector);
-      if (filePath === `/proc/${CHILD.pid}/stat`) return processStat(CHILD, options.child);
-      throw Object.assign(new Error("gone"), { code: "ENOENT" });
-    },
-    readLink(filePath) {
-      if (filePath === `/proc/${CONNECTOR.pid}/ns/pid`) return namespace(options.connector);
-      if (filePath === `/proc/${CHILD.pid}/ns/pid`) return namespace(options.child);
-      throw Object.assign(new Error("gone"), { code: "ENOENT" });
+    readers: {
+      readFile(filePath) {
+        if (filePath === "/proc/sys/kernel/random/boot_id") return `${BOOT_ID}\n`;
+        if (filePath === `/proc/${CONNECTOR.pid}/stat`) return processStat(CONNECTOR, options.connector);
+        if (filePath === `/proc/${CHILD.pid}/stat`) return processStat(CHILD, options.child);
+        throw Object.assign(new Error("gone"), { code: "ENOENT" });
+      },
+      readLink(filePath) {
+        if (filePath === `/proc/${CONNECTOR.pid}/ns/pid`) return namespace(options.connector);
+        if (filePath === `/proc/${CHILD.pid}/ns/pid`) return namespace(options.child);
+        throw Object.assign(new Error("gone"), { code: "ENOENT" });
+      }
     }
-  };
+  });
 }
 
 function processStat(identity: LinuxProcessIdentity, state: "same" | "gone" | "unverifiable"): string {
@@ -157,7 +160,7 @@ describe("admission startup recovery", () => {
     dispatch(admission);
 
     expect(recoverExitedAdmissionSeats(admission, {
-      readers: readers({ connector: "gone", child: "gone", processIds: [] }),
+      processEvidence: processEvidence({ connector: "gone", child: "gone", processIds: [] }),
       now: () => 2_000
     })).toEqual({ inspected: 1, released: 1, retained: 0, markedRecoveryRequired: 0 });
 
@@ -175,7 +178,7 @@ describe("admission startup recovery", () => {
     dispatch(admission);
 
     expect(recoverExitedAdmissionSeats(admission, {
-      readers: readers({ connector: "gone", child: "same", processIds: [CHILD.pid] }),
+      processEvidence: processEvidence({ connector: "gone", child: "same", processIds: [CHILD.pid] }),
       now: () => 2_000
     })).toEqual({ inspected: 1, released: 0, retained: 1, markedRecoveryRequired: 1 });
 
@@ -189,7 +192,7 @@ describe("admission startup recovery", () => {
     dispatch(admission);
 
     expect(recoverExitedAdmissionSeats(admission, {
-      readers: readers({ connector: "gone", child: "gone", listUnavailable: true }),
+      processEvidence: processEvidence({ connector: "gone", child: "gone", listUnavailable: true }),
       now: () => 2_000
     })).toEqual({ inspected: 1, released: 0, retained: 1, markedRecoveryRequired: 0 });
 

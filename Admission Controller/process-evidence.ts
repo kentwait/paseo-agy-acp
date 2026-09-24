@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { readFileSync, readlinkSync } from "node:fs";
+import { readFileSync, readdirSync, readlinkSync } from "node:fs";
 
 const BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id";
 const MAX_PID = 2_147_483_647;
@@ -20,8 +20,8 @@ export interface LinuxProcessEvidenceReaders {
   readLink(path: string): string;
 }
 
-/** Immutable Linux evidence used to distinguish a PID from a later PID reuse. */
-export interface LinuxProcessIdentity {
+/** Immutable evidence used to distinguish a PID from a later PID reuse. */
+export interface ProcessIdentity {
   readonly bootId: string;
   readonly pid: number;
   readonly startTimeTicks: string;
@@ -30,6 +30,8 @@ export interface LinuxProcessIdentity {
   readonly pgrp: number;
   readonly session: number;
 }
+
+export type LinuxProcessIdentity = ProcessIdentity;
 
 export interface LinuxProcessStatEvidence {
   readonly pid: number;
@@ -86,9 +88,21 @@ export interface LinuxPreDispatchTerminationProof extends LinuxPreDispatchProofP
   readonly proofHmac: string;
 }
 
+export type ProcessEvidencePlatform = "linux";
+
 /** A conservative observation of a persisted process identity. */
-export type LinuxProcessIdentityState = "same" | "gone" | "pid_reused" | "unverifiable";
-export type LinuxProcessGroupState = "empty" | "present" | "unverifiable";
+export type ProcessIdentityState = "same" | "gone" | "pid_reused" | "unverifiable";
+export type ProcessGroupState = "empty" | "present" | "unverifiable";
+
+export type LinuxProcessIdentityState = ProcessIdentityState;
+export type LinuxProcessGroupState = ProcessGroupState;
+
+export interface ProcessEvidence {
+  readonly platform: ProcessEvidencePlatform;
+  capture(pid: number): ProcessIdentity;
+  observe(expected: unknown): ProcessIdentityState;
+  inspectProcessGroup(expected: unknown): ProcessGroupState;
+}
 
 export class ProcessEvidenceError extends Error {
   readonly kind: "process_gone" | "unverifiable";
@@ -112,6 +126,68 @@ export const nativeLinuxProcessEvidenceReaders: LinuxProcessEvidenceReaders = Ob
     return readlinkSync(path, "utf8");
   }
 });
+
+export interface LinuxProcessEvidenceOptions {
+  readonly readers?: LinuxProcessEvidenceReaders;
+  readonly listProcessIds?: () => readonly number[];
+}
+
+export function createLinuxProcessEvidence(options: LinuxProcessEvidenceOptions = {}): ProcessEvidence {
+  const readers = options.readers ?? nativeLinuxProcessEvidenceReaders;
+  requireReaders(readers);
+  const listProcessIds = options.listProcessIds ?? nativeLinuxProcessIds;
+  if (typeof listProcessIds !== "function") throw new ProcessEvidenceError("process inventory reader is invalid");
+
+  return Object.freeze({
+    platform: "linux",
+    capture(pid: number): ProcessIdentity {
+      return captureLinuxProcessIdentity(pid, readers);
+    },
+    observe(expected: unknown): ProcessIdentityState {
+      return observeLinuxProcessIdentity(expected, readers);
+    },
+    inspectProcessGroup(expected: unknown): ProcessGroupState {
+      const processIds = readLinuxProcessIds(listProcessIds);
+      return processIds === null ? "unverifiable" : inspectLinuxProcessGroup(expected, processIds, readers);
+    }
+  });
+}
+
+export function requireProcessEvidence(value: unknown): ProcessEvidence {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    typeof (value as ProcessEvidence).capture !== "function" ||
+    typeof (value as ProcessEvidence).observe !== "function" ||
+    typeof (value as ProcessEvidence).inspectProcessGroup !== "function"
+  ) {
+    throw new ProcessEvidenceError("process evidence adapter is invalid");
+  }
+  return value as ProcessEvidence;
+}
+
+function nativeLinuxProcessIds(): readonly number[] {
+  return readdirSync("/proc", { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && /^[1-9][0-9]*$/.test(entry.name))
+    .map((entry) => Number(entry.name))
+    .filter((pid) => Number.isSafeInteger(pid) && pid > 0 && pid <= MAX_PID);
+}
+
+function readLinuxProcessIds(listProcessIds: () => readonly number[]): readonly number[] | null {
+  let value: unknown;
+  try {
+    value = listProcessIds();
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(value)) return null;
+  const ids: number[] = [];
+  for (const pid of value) {
+    if (!Number.isSafeInteger(pid) || pid < 1 || pid > MAX_PID) return null;
+    ids.push(pid);
+  }
+  return Object.freeze([...new Set(ids)].sort((left, right) => left - right));
+}
 
 /**
  * Construct the local proof authority from a caller-owned 32-byte key. The
@@ -215,7 +291,7 @@ export function validateLinuxPreDispatchProofBinding(value: unknown): LinuxPreDi
 export function captureLinuxProcessIdentity(
   pid: number,
   readers: LinuxProcessEvidenceReaders = nativeLinuxProcessEvidenceReaders
-): LinuxProcessIdentity {
+): ProcessIdentity {
   const expectedPid = requirePositiveNumber(pid, "pid", MAX_PID);
   requireReaders(readers);
 
@@ -245,13 +321,13 @@ export function captureLinuxProcessIdentity(
 export function observeLinuxProcessIdentity(
   expected: unknown,
   readers: LinuxProcessEvidenceReaders = nativeLinuxProcessEvidenceReaders
-): LinuxProcessIdentityState {
+): ProcessIdentityState {
   const normalizedExpected = normalizeIdentity(expected);
   if (normalizedExpected === null) return "unverifiable";
 
   try {
     const observed = captureLinuxProcessIdentity(normalizedExpected.pid, readers);
-    return isSameLinuxProcessIdentity(normalizedExpected, observed) ? "same" : "pid_reused";
+    return isSameProcessIdentity(normalizedExpected, observed) ? "same" : "pid_reused";
   } catch (error) {
     return error instanceof ProcessEvidenceError && error.kind === "process_gone" ? "gone" : "unverifiable";
   }
@@ -266,7 +342,7 @@ export function inspectLinuxProcessGroup(
   expected: unknown,
   processIds: readonly number[],
   readers: LinuxProcessEvidenceReaders = nativeLinuxProcessEvidenceReaders
-): LinuxProcessGroupState {
+): ProcessGroupState {
   const normalizedExpected = normalizeIdentity(expected);
   if (normalizedExpected === null || !Array.isArray(processIds)) return "unverifiable";
 
@@ -295,7 +371,7 @@ export function inspectLinuxProcessGroup(
       continue;
     }
 
-    let observed: LinuxProcessIdentity;
+    let observed: ProcessIdentity;
     try {
       observed = captureLinuxProcessIdentity(pid, readers);
     } catch (error) {
@@ -356,7 +432,7 @@ export function parseLinuxProcessStat(value: unknown): LinuxProcessStatEvidence 
  * Return false rather than throwing when persisted evidence is incomplete,
  * malformed, or differs in any identity field.
  */
-export function isSameLinuxProcessIdentity(expected: unknown, observed: unknown): boolean {
+export function isSameProcessIdentity(expected: unknown, observed: unknown): boolean {
   const left = normalizeIdentity(expected);
   const right = normalizeIdentity(observed);
   if (left === null || right === null) return false;
@@ -371,6 +447,8 @@ export function isSameLinuxProcessIdentity(expected: unknown, observed: unknown)
     left.session === right.session
   );
 }
+
+export const isSameLinuxProcessIdentity = isSameProcessIdentity;
 
 function normalizeLinuxPreDispatchProofPayload(value: unknown): LinuxPreDispatchProofPayload | null {
   const record = exactRecord(value, ["binding", "subject", "observedAt", "owner", "root", "residue"]);

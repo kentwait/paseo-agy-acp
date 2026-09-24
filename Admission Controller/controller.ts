@@ -5,12 +5,11 @@ import {
   assertAdmissionSchemaIntegrity
 } from "./schema.js";
 import {
-  captureLinuxProcessIdentity,
-  inspectLinuxProcessGroup,
-  nativeLinuxProcessEvidenceReaders,
-  observeLinuxProcessIdentity,
-  type LinuxProcessEvidenceReaders,
-  type LinuxProcessIdentityState
+  createLinuxProcessEvidence,
+  requireProcessEvidence,
+  type ProcessEvidence,
+  type ProcessIdentity,
+  type ProcessIdentityState
 } from "./process-evidence.js";
 import {
   isAllowedAdmissionActiveTurns,
@@ -24,7 +23,6 @@ export {
 
 const MAX_DISPATCH_CONTENTION_RECHECKS = 500;
 const DISPATCH_CONTENTION_RECHECK_DELAY_MS = 2;
-const MAX_RUNTIME_PID = 2_147_483_647;
 const LEASE_HEARTBEAT_STALE_MS = 4_000;
 
 const dispatchContentionRetrySignal = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
@@ -42,6 +40,7 @@ export interface AdmissionControllerOptions {
   policy: AdmissionPolicy;
   encryptionKey?: Buffer;
   contentFingerprintKey?: Buffer;
+  processEvidence?: ProcessEvidence;
   /** Test-only synchronous hook for proving rollback at the atomic dispatch boundary. */
   faultInjection?: AdmissionControllerFaultInjection;
 }
@@ -58,7 +57,7 @@ interface EnqueueRequestBase {
   provider: string;
   model: string;
   now: number;
-  ownerIdentity?: VerifiedLinuxConnectorIdentity;
+  ownerIdentity?: VerifiedConnectorIdentity;
 }
 
 export type EnqueueRequest = EnqueueRequestBase & {
@@ -169,41 +168,39 @@ export type RecoverableDispatchPhase =
   | "active"
   | "recovery_required";
 
-/** Immutable evidence for one Linux process instance. */
-export interface VerifiedLinuxProcessIdentity {
-  bootId: string;
-  pid: number;
-  startTimeTicks: string;
-  pidNamespaceInode: number;
-  ppid: number;
-  pgrp: number;
-  session: number;
-}
+/** Immutable evidence for one process instance. */
+export type VerifiedProcessIdentity = ProcessIdentity;
+
+export type VerifiedLinuxProcessIdentity = VerifiedProcessIdentity;
 
 /** Connector owner evidence paired with the connector's stable instance ID. */
-export interface VerifiedLinuxConnectorIdentity extends VerifiedLinuxProcessIdentity {
+export interface VerifiedConnectorIdentity extends ProcessIdentity {
   ownerInstanceId: string;
   createdAt: string;
 }
 
+export type VerifiedLinuxConnectorIdentity = VerifiedConnectorIdentity;
+
 /** The only process record accepted at the irreversible dispatch boundary. */
-export interface VerifiedLinuxProcessRecord {
+export interface VerifiedProcessRecord {
   requestId: string;
   leaseId: string;
   generation: number;
   ownerInstanceId: string;
   processIdentity: {
-    connector: VerifiedLinuxConnectorIdentity;
-    child: VerifiedLinuxProcessIdentity;
+    connector: VerifiedConnectorIdentity;
+    child: VerifiedProcessIdentity;
   };
   promptChannel: "stdin" | "pty";
 }
 
+export type VerifiedLinuxProcessRecord = VerifiedProcessRecord;
+
 /** Durable process evidence available to startup recovery, never request content. */
 export interface RecoverableDispatchProcessIdentity {
   readonly promptChannel: "stdin" | "pty";
-  readonly connector: VerifiedLinuxConnectorIdentity;
-  readonly child: VerifiedLinuxProcessIdentity;
+  readonly connector: VerifiedConnectorIdentity;
+  readonly child: VerifiedProcessIdentity;
 }
 
 /**
@@ -225,14 +222,10 @@ export interface RecoverableDispatch {
 /** Durable queued-owner evidence for a request that has not dispatched. */
 export interface RecoverableQueuedOwner {
   readonly requestId: string;
-  readonly owner: VerifiedLinuxConnectorIdentity;
+  readonly owner: VerifiedConnectorIdentity;
 }
 
 export type LeaseSuspectReason = "heartbeat_expired" | "identity_unverifiable";
-
-export interface AdmissionRuntimeReaperReaders extends LinuxProcessEvidenceReaders {
-  listProcessIds(): readonly number[];
-}
 
 export interface AdmissionRuntimeReaperSummary {
   readonly inspected: number;
@@ -473,7 +466,8 @@ export class AdmissionController {
   readonly #encryptionKey?: Buffer;
   readonly #contentFingerprintKey?: Buffer;
   readonly #faultInjection?: AdmissionControllerFaultInjection;
-  readonly #queuedOwnerIdentity: VerifiedLinuxConnectorIdentity;
+  readonly #processEvidence: ProcessEvidence;
+  readonly #queuedOwnerIdentity: VerifiedConnectorIdentity;
 
   constructor(options: AdmissionControllerOptions) {
     this.databasePath = options.databasePath;
@@ -481,7 +475,8 @@ export class AdmissionController {
     this.#encryptionKey = validatePurposeKey(options.encryptionKey, "encryption");
     this.#contentFingerprintKey = validatePurposeKey(options.contentFingerprintKey, "content fingerprint");
     this.#faultInjection = validateFaultInjection(options.faultInjection);
-    this.#queuedOwnerIdentity = captureControllerQueuedOwnerIdentity();
+    this.#processEvidence = requireProcessEvidence(options.processEvidence ?? createLinuxProcessEvidence());
+    this.#queuedOwnerIdentity = captureControllerQueuedOwnerIdentity(this.#processEvidence);
     this.#db = new Database(options.databasePath);
     this.#db.pragma("foreign_keys = ON");
     this.#db.pragma("journal_mode = WAL");
@@ -505,6 +500,10 @@ export class AdmissionController {
       .prepare("SELECT MAX(version) AS version FROM schema_migrations")
       .get() as { version: number | null };
     return row.version ?? 0;
+  }
+
+  get processEvidence(): ProcessEvidence {
+    return this.#processEvidence;
   }
 
   enqueue(input: EnqueueRequest): { requestId: string; existed: boolean } {
@@ -875,9 +874,9 @@ export class AdmissionController {
    * Runtime recovery is evidence-only: a stale heartbeat can mark suspicion,
    * but only connector/child/process-group proof can release local capacity.
    */
-  reapSuspects(now: number, readers: AdmissionRuntimeReaperReaders): AdmissionRuntimeReaperSummary {
+  reapSuspects(now: number, processEvidence: ProcessEvidence): AdmissionRuntimeReaperSummary {
     validateTimestamp(now, "runtime reaper timestamp");
-    const processIds = readRuntimeProcessIds(readers);
+    const evidence = requireProcessEvidence(processEvidence);
     let released = 0;
     let retained = 0;
     let markedRecoveryRequired = 0;
@@ -885,7 +884,7 @@ export class AdmissionController {
     let queuedSettled = 0;
 
     for (const queuedOwner of this.listRecoverableQueuedOwners()) {
-      const owner = observeLinuxProcessIdentity(queuedOwner.owner, readers);
+      const owner = evidence.observe(queuedOwner.owner);
       if (isGoneIdentity(owner)) {
         if (this.settleQueuedOwnerDeath(queuedOwner.requestId, queuedOwner.owner.ownerInstanceId, now)) {
           queuedSettled += 1;
@@ -895,18 +894,23 @@ export class AdmissionController {
 
     const dispatches = this.listRecoverableDispatches();
     for (const dispatch of dispatches) {
-      if (isHeartbeatStale(dispatch.heartbeatAt, now) || dispatch.processIdentity === null || processIds === null) {
-        if (this.markSuspect(dispatch.fence, now, suspectReason(dispatch, processIds))) suspected += 1;
-      }
-
-      if (dispatch.processIdentity === null || processIds === null) {
+      if (dispatch.processIdentity === null) {
+        if (this.markSuspect(dispatch.fence, now, "identity_unverifiable")) suspected += 1;
         retained += 1;
         continue;
       }
 
-      const connector = observeLinuxProcessIdentity(dispatch.processIdentity.connector, readers);
-      const child = observeLinuxProcessIdentity(dispatch.processIdentity.child, readers);
-      const residue = inspectLinuxProcessGroup(dispatch.processIdentity.child, processIds, readers);
+      const connector = evidence.observe(dispatch.processIdentity.connector);
+      const child = evidence.observe(dispatch.processIdentity.child);
+      const residue = evidence.inspectProcessGroup(dispatch.processIdentity.child);
+      const unverifiable =
+        connector === "unverifiable" || child === "unverifiable" || residue === "unverifiable";
+
+      if (unverifiable || isHeartbeatStale(dispatch.heartbeatAt, now)) {
+        const reason = unverifiable ? "identity_unverifiable" : "heartbeat_expired";
+        if (this.markSuspect(dispatch.fence, now, reason)) suspected += 1;
+      }
+
       if (isGoneIdentity(connector) && isGoneIdentity(child) && residue === "empty") {
         try {
           this.releaseExitedRecoverySeat(dispatch.fence, now);
@@ -918,8 +922,7 @@ export class AdmissionController {
         }
       }
 
-      if (connector === "unverifiable" || child === "unverifiable" || residue === "unverifiable") {
-        if (this.markSuspect(dispatch.fence, now, "identity_unverifiable")) suspected += 1;
+      if (unverifiable) {
         retained += 1;
         continue;
       }
@@ -1423,7 +1426,7 @@ export class AdmissionController {
   }
 
   private persistProcessIdentityAndDispatchIntent(input: unknown): AtomicDispatchIntentOutcome {
-    const record = normalizeVerifiedLinuxProcessRecord(input);
+    const record = normalizeVerifiedProcessRecord(input);
     if (record === null) return { status: "not_committed", reason: "invalid_process_identity" };
 
     try {
@@ -1441,7 +1444,7 @@ export class AdmissionController {
 
   /** A failed writer may inspect only a committed, exact winner; it never retries a write. */
   private recheckDispatchIdentityAfterContention(
-    record: VerifiedLinuxProcessRecord
+    record: VerifiedProcessRecord
   ): AtomicDispatchIntentOutcome | null {
     for (let attempt = 0; attempt < MAX_DISPATCH_CONTENTION_RECHECKS; attempt += 1) {
       try {
@@ -1459,7 +1462,7 @@ export class AdmissionController {
 
   /** Reads the lease and identity under one snapshot so no partial winner can be inferred. */
   private inspectDispatchIdentityContentionWinner(
-    record: VerifiedLinuxProcessRecord
+    record: VerifiedProcessRecord
   ): AtomicDispatchIntentOutcome | "pending" | null {
     const lease = this.#db
       .prepare(
@@ -1500,7 +1503,7 @@ export class AdmissionController {
   }
 
   private persistProcessIdentityAndDispatchIntentInTransaction(
-    record: VerifiedLinuxProcessRecord
+    record: VerifiedProcessRecord
   ): AtomicDispatchIntentOutcome {
     const lease = this.#db
       .prepare(
@@ -1572,7 +1575,7 @@ export class AdmissionController {
       .get(leaseId) as LeaseProcessIdentityRow | undefined;
   }
 
-  private insertLeaseProcessIdentity(record: VerifiedLinuxProcessRecord, recordedAt: number): void {
+  private insertLeaseProcessIdentity(record: VerifiedProcessRecord, recordedAt: number): void {
     const { connector, child } = record.processIdentity;
     this.#db
       .prepare(
@@ -1611,7 +1614,7 @@ export class AdmissionController {
   }
 
   private persistQueuedOwnerReference(input: EnqueueRequest, recordedAt: number, requestExisted: boolean): void {
-    const owner = normalizeVerifiedLinuxConnectorIdentity(input.ownerIdentity ?? this.#queuedOwnerIdentity);
+    const owner = normalizeVerifiedConnectorIdentity(input.ownerIdentity ?? this.#queuedOwnerIdentity);
     const existingOwner = this.findQueuedOwnerIdentity(owner.ownerInstanceId);
     if (existingOwner === undefined) {
       this.insertQueuedOwnerIdentity(owner, recordedAt);
@@ -1657,7 +1660,7 @@ export class AdmissionController {
       .get(ownerInstanceId) as QueuedOwnerIdentityRow | undefined;
   }
 
-  private insertQueuedOwnerIdentity(owner: VerifiedLinuxConnectorIdentity, recordedAt: number): void {
+  private insertQueuedOwnerIdentity(owner: VerifiedConnectorIdentity, recordedAt: number): void {
     this.#db
       .prepare(
         `INSERT INTO queued_owner_instances (
@@ -2358,7 +2361,7 @@ function isSqliteTransactionContention(error: unknown): boolean {
   );
 }
 
-function normalizeVerifiedLinuxProcessRecord(value: unknown): VerifiedLinuxProcessRecord | null {
+function normalizeVerifiedProcessRecord(value: unknown): VerifiedProcessRecord | null {
   try {
     const record = dataRecord(value, ["requestId", "leaseId", "generation", "ownerInstanceId", "processIdentity", "promptChannel"]);
     if (record === null) return null;
@@ -2366,8 +2369,8 @@ function normalizeVerifiedLinuxProcessRecord(value: unknown): VerifiedLinuxProce
     if (processIdentity === null) return null;
 
     const ownerInstanceId = normalizeOwnerInstanceId(record.ownerInstanceId);
-    const connector = normalizeVerifiedLinuxConnectorIdentity(processIdentity.connector);
-    const child = normalizeVerifiedLinuxProcessIdentity(processIdentity.child);
+    const connector = normalizeVerifiedConnectorIdentity(processIdentity.connector);
+    const child = normalizeVerifiedProcessIdentity(processIdentity.child);
     if (connector.ownerInstanceId !== ownerInstanceId) return null;
     const promptChannel = record.promptChannel;
     if (promptChannel !== "stdin" && promptChannel !== "pty") return null;
@@ -2385,15 +2388,15 @@ function normalizeVerifiedLinuxProcessRecord(value: unknown): VerifiedLinuxProce
   }
 }
 
-function captureControllerQueuedOwnerIdentity(): VerifiedLinuxConnectorIdentity {
-  return normalizeVerifiedLinuxConnectorIdentity({
+function captureControllerQueuedOwnerIdentity(processEvidence: ProcessEvidence): VerifiedConnectorIdentity {
+  return normalizeVerifiedConnectorIdentity({
     ownerInstanceId: randomUUID(),
     createdAt: new Date().toISOString(),
-    ...captureLinuxProcessIdentity(process.pid, nativeLinuxProcessEvidenceReaders)
+    ...processEvidence.capture(process.pid)
   });
 }
 
-function normalizeVerifiedLinuxConnectorIdentity(value: unknown): VerifiedLinuxConnectorIdentity {
+function normalizeVerifiedConnectorIdentity(value: unknown): VerifiedConnectorIdentity {
   const record = dataRecord(value, [
     "ownerInstanceId",
     "createdAt",
@@ -2409,17 +2412,17 @@ function normalizeVerifiedLinuxConnectorIdentity(value: unknown): VerifiedLinuxC
   return Object.freeze({
     ownerInstanceId: normalizeOwnerInstanceId(record.ownerInstanceId),
     createdAt: normalizeCanonicalUtcTimestamp(record.createdAt),
-    ...normalizeVerifiedLinuxProcessIdentityFields(record)
+    ...normalizeVerifiedProcessIdentityFields(record)
   });
 }
 
-function normalizeVerifiedLinuxProcessIdentity(value: unknown): VerifiedLinuxProcessIdentity {
+function normalizeVerifiedProcessIdentity(value: unknown): VerifiedProcessIdentity {
   const record = dataRecord(value, ["bootId", "pid", "startTimeTicks", "pidNamespaceInode", "ppid", "pgrp", "session"]);
   if (record === null) throw new Error("process identity is invalid");
-  return normalizeVerifiedLinuxProcessIdentityFields(record);
+  return normalizeVerifiedProcessIdentityFields(record);
 }
 
-function normalizeVerifiedLinuxProcessIdentityFields(record: Record<string, unknown>): VerifiedLinuxProcessIdentity {
+function normalizeVerifiedProcessIdentityFields(record: Record<string, unknown>): VerifiedProcessIdentity {
   return Object.freeze({
     bootId: normalizeBootId(record.bootId),
     pid: normalizePositiveSafeInteger(record.pid, "process PID", 2_147_483_647),
@@ -2431,7 +2434,7 @@ function normalizeVerifiedLinuxProcessIdentityFields(record: Record<string, unkn
   });
 }
 
-function sameLeaseProcessIdentity(row: LeaseProcessIdentityRow, record: VerifiedLinuxProcessRecord): boolean {
+function sameLeaseProcessIdentity(row: LeaseProcessIdentityRow, record: VerifiedProcessRecord): boolean {
   const { connector, child } = record.processIdentity;
   return (
     row.request_id === record.requestId &&
@@ -2457,7 +2460,7 @@ function sameLeaseProcessIdentity(row: LeaseProcessIdentityRow, record: Verified
   );
 }
 
-function sameQueuedOwnerIdentity(row: QueuedOwnerIdentityRow, owner: VerifiedLinuxConnectorIdentity): boolean {
+function sameQueuedOwnerIdentity(row: QueuedOwnerIdentityRow, owner: VerifiedConnectorIdentity): boolean {
   return (
     row.owner_instance_id === owner.ownerInstanceId &&
     row.created_at === owner.createdAt &&
@@ -2543,37 +2546,6 @@ function normalizePositiveSafeInteger(value: unknown, label: string, maximum: nu
   return value;
 }
 
-function readRuntimeProcessIds(readers: AdmissionRuntimeReaperReaders): readonly number[] | null {
-  if (
-    typeof readers !== "object" ||
-    readers === null ||
-    typeof readers.listProcessIds !== "function"
-  ) {
-    return null;
-  }
-
-  let value: unknown;
-  try {
-    value = readers.listProcessIds();
-  } catch {
-    return null;
-  }
-  if (!Array.isArray(value)) return null;
-  const ids: number[] = [];
-  for (const pid of value) {
-    if (!Number.isSafeInteger(pid) || pid < 1 || pid > MAX_RUNTIME_PID) return null;
-    ids.push(pid);
-  }
-  return Object.freeze([...new Set(ids)].sort((left, right) => left - right));
-}
-
-function suspectReason(
-  dispatch: RecoverableDispatch,
-  processIds: readonly number[] | null
-): LeaseSuspectReason {
-  return dispatch.processIdentity === null || processIds === null ? "identity_unverifiable" : "heartbeat_expired";
-}
-
 function validateSuspectReason(reason: LeaseSuspectReason): void {
   if (reason !== "heartbeat_expired" && reason !== "identity_unverifiable") {
     throw new Error("lease suspect reason is invalid");
@@ -2584,7 +2556,7 @@ function isHeartbeatStale(heartbeatAt: number, now: number): boolean {
   return now - heartbeatAt > LEASE_HEARTBEAT_STALE_MS;
 }
 
-function isGoneIdentity(value: LinuxProcessIdentityState): boolean {
+function isGoneIdentity(value: ProcessIdentityState): boolean {
   return value === "gone" || value === "pid_reused";
 }
 
@@ -2599,8 +2571,8 @@ function toRecoverableQueuedOwner(row: RecoverableQueuedOwnerRow): RecoverableQu
   }
 }
 
-function normalizeQueuedOwnerIdentityRow(row: QueuedOwnerIdentityRow): VerifiedLinuxConnectorIdentity {
-  return normalizeVerifiedLinuxConnectorIdentity({
+function normalizeQueuedOwnerIdentityRow(row: QueuedOwnerIdentityRow): VerifiedConnectorIdentity {
+  return normalizeVerifiedConnectorIdentity({
     ownerInstanceId: row.owner_instance_id,
     createdAt: row.created_at,
     bootId: row.boot_id,
@@ -2723,7 +2695,7 @@ function toRecoverableDispatchProcessIdentity(
     throw new Error("process identity prompt channel is invalid");
   }
 
-  const connector = normalizeVerifiedLinuxConnectorIdentity({
+  const connector = normalizeVerifiedConnectorIdentity({
     ownerInstanceId: row.identity_connector_owner_instance_id,
     createdAt: row.identity_connector_created_at,
     bootId: row.identity_connector_boot_id,
@@ -2737,7 +2709,7 @@ function toRecoverableDispatchProcessIdentity(
   if (connector.ownerInstanceId !== fence.ownerInstanceId) {
     throw new Error("connector process identity owner mismatch");
   }
-  const child = normalizeVerifiedLinuxProcessIdentity({
+  const child = normalizeVerifiedProcessIdentity({
     bootId: row.identity_child_boot_id,
     pid: row.identity_child_pid,
     startTimeTicks: row.identity_child_start_time_ticks,
