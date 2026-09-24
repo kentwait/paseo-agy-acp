@@ -1,6 +1,5 @@
 import type { AdmissionController } from "../../Admission Controller/controller.js";
 import {
-  createLinuxProcessEvidence,
   requireProcessEvidence,
   type ProcessEvidence,
   type ProcessIdentityState
@@ -28,7 +27,10 @@ export function recoverExitedAdmissionSeats(
   controller: AdmissionController,
   options: AdmissionStartupRecoveryOptions = {}
 ): AdmissionStartupRecoverySummary {
-  const evidence = requireProcessEvidence(options.processEvidence ?? createLinuxProcessEvidence());
+  const evidence = requireProcessEvidence(options.processEvidence ?? controller.processEvidence);
+  if (evidence.platform !== controller.processEvidence.platform) {
+    throw new Error("process evidence platform does not match durable admission platform");
+  }
   const now = readNow(options.now ?? Date.now);
 
   let released = 0;

@@ -98,6 +98,9 @@ export class AdmissionTurnCoordinator {
     this.#controller = options.controller;
     this.#agentId = optionAgentId(options);
     this.#processEvidence = requireProcessEvidence(options.processEvidence ?? options.controller.processEvidence);
+    if (this.#processEvidence.platform !== options.controller.processEvidence.platform) {
+      throw new Error("process evidence platform does not match durable admission platform");
+    }
     this.#now = options.now ?? Date.now;
     this.#createRequestId = options.createRequestId ?? randomUUID;
     this.#queuePollIntervalMs = positiveInterval(
