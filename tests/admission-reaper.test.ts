@@ -7,11 +7,13 @@ import { createAdmissionRuntime } from "../ACP Connector/admission/runtime.js";
 import {
   AdmissionController,
   type AdmissionLease,
-  type AdmissionRuntimeReaperReaders,
   type AdmissionPolicy
 } from "../Admission Controller/controller.js";
-import type { LinuxProcessIdentity } from "../Admission Controller/process-evidence.js";
-import type { AdmissionStartupRecoveryReaders } from "../ACP Connector/admission/startup-recovery.js";
+import {
+  createLinuxProcessEvidence,
+  type LinuxProcessIdentity,
+  type ProcessEvidence
+} from "../Admission Controller/process-evidence.js";
 
 const BOOT_ID = "f4bca3da-9bd5-4f2e-89b8-5e12e5ee8f31";
 const NAMESPACE_INODE = 4_026_531_836;
@@ -38,13 +40,13 @@ interface ReaperSummary {
 }
 
 interface RuntimeReaperController {
-  reapSuspects?(now: number, readers: AdmissionStartupRecoveryReaders): ReaperSummary;
+  reapSuspects?(now: number, processEvidence: ProcessEvidence): ReaperSummary;
 }
 
 type CreateAdmissionRuntimeWithReaper = (
   environment: NodeJS.ProcessEnv,
   options: {
-    readonly reaperReaders: AdmissionRuntimeReaperReaders;
+    readonly processEvidence: ProcessEvidence;
     readonly reaperIntervalMs: number;
   }
 ) => ReturnType<typeof createAdmissionRuntime>;
@@ -152,7 +154,7 @@ function makeActiveLease(
 function runReaperIfPresent(
   admission: AdmissionController,
   now: number,
-  readers: AdmissionStartupRecoveryReaders
+  processEvidence: ProcessEvidence
 ): ReaperSummary {
   const reaper = (admission as RuntimeReaperController).reapSuspects;
   if (typeof reaper !== "function") {
@@ -164,7 +166,7 @@ function runReaperIfPresent(
       missing: true
     });
   }
-  return reaper.call(admission, now, readers);
+  return reaper.call(admission, now, processEvidence);
 }
 
 function identitiesForSlot(slot: number): { connector: LinuxProcessIdentity; child: LinuxProcessIdentity } {
@@ -192,30 +194,56 @@ function identitiesForSlot(slot: number): { connector: LinuxProcessIdentity; chi
   };
 }
 
-function readers(options: {
+function processEvidence(options: {
   processState: "same" | "gone" | "unverifiable";
   processIds?: readonly number[];
-}): AdmissionStartupRecoveryReaders & AdmissionRuntimeReaperReaders {
-  return {
+}): ProcessEvidence {
+  const adapter = createLinuxProcessEvidence({
     listProcessIds() {
       return options.processIds ?? [];
     },
-    readFile(filePath) {
-      if (filePath === "/proc/sys/kernel/random/boot_id") return `${BOOT_ID}\n`;
-      const identity = identityForProcPath(filePath);
-      if (identity === null) throw Object.assign(new Error("gone"), { code: "ENOENT" });
-      if (options.processState === "gone") throw Object.assign(new Error("gone"), { code: "ENOENT" });
-      if (options.processState === "unverifiable") throw new Error("unreadable process stat");
-      return processStat(identity);
-    },
-    readLink(filePath) {
-      const identity = identityForNamespacePath(filePath);
-      if (identity === null) throw Object.assign(new Error("gone"), { code: "ENOENT" });
-      if (options.processState === "gone") throw Object.assign(new Error("gone"), { code: "ENOENT" });
-      if (options.processState === "unverifiable") throw new Error("unreadable namespace");
-      return `pid:[${identity.pidNamespaceInode}]`;
+    readers: {
+      readFile(filePath) {
+        if (filePath === "/proc/sys/kernel/random/boot_id") return `${BOOT_ID}\n`;
+        const identity = identityForProcPath(filePath);
+        if (identity === null) throw Object.assign(new Error("gone"), { code: "ENOENT" });
+        if (options.processState === "gone") throw Object.assign(new Error("gone"), { code: "ENOENT" });
+        if (options.processState === "unverifiable") throw new Error("unreadable process stat");
+        return processStat(identity);
+      },
+      readLink(filePath) {
+        const identity = identityForNamespacePath(filePath);
+        if (identity === null) throw Object.assign(new Error("gone"), { code: "ENOENT" });
+        if (options.processState === "gone") throw Object.assign(new Error("gone"), { code: "ENOENT" });
+        if (options.processState === "unverifiable") throw new Error("unreadable namespace");
+        return `pid:[${identity.pidNamespaceInode}]`;
+      }
     }
-  };
+  });
+  return Object.freeze({
+    platform: adapter.platform,
+    capture(pid: number) {
+      return identityForPid(pid) ?? syntheticIdentity(pid);
+    },
+    observe(expected: unknown) {
+      return adapter.observe(expected);
+    },
+    inspectProcessGroup(expected: unknown) {
+      return adapter.inspectProcessGroup(expected);
+    }
+  });
+}
+
+function syntheticIdentity(pid: number): LinuxProcessIdentity {
+  return Object.freeze({
+    bootId: BOOT_ID,
+    pid,
+    startTimeTicks: String(30_000 + pid),
+    pidNamespaceInode: NAMESPACE_INODE,
+    ppid: 1,
+    pgrp: pid,
+    session: pid
+  });
 }
 
 function identityForProcPath(filePath: string): LinuxProcessIdentity | null {
@@ -317,7 +345,7 @@ describe("S3-T14 heartbeat suspect and runtime reaper", () => {
       AGY_ACP_STATE_DIR: directory,
       PASEO_AGENT_ID: "runtime-reaper-agent"
     }, {
-      reaperReaders: readers({ processState: "gone", processIds: [] }),
+      processEvidence: processEvidence({ processState: "gone", processIds: [] }),
       reaperIntervalMs: 1_000
     });
     expect(runtime).not.toBeNull();
@@ -352,8 +380,8 @@ describe("S3-T14 heartbeat suspect and runtime reaper", () => {
     const admission = controller();
     for (const slot of [1, 2, 3]) makeRecoveryRequired(admission, `recovery-${slot}`, slot);
 
-    const summary = runReaperIfPresent(admission, 5_000, readers({ processState: "gone", processIds: [] }));
-    const repeatSummary = runReaperIfPresent(admission, 5_001, readers({ processState: "gone", processIds: [] }));
+    const summary = runReaperIfPresent(admission, 5_000, processEvidence({ processState: "gone", processIds: [] }));
+    const repeatSummary = runReaperIfPresent(admission, 5_001, processEvidence({ processState: "gone", processIds: [] }));
     enqueue(admission, "after-recovery", "fresh-agent", 5_002);
     const admittedAfterReap = admission.admitNext(5_003, `${OWNER_PREFIX}8`);
 
@@ -379,7 +407,7 @@ describe("S3-T14 heartbeat suspect and runtime reaper", () => {
     const lease = makeExpiredActiveLease(admission);
     const child = identitiesForSlot(9).child;
 
-    const summary = runReaperIfPresent(admission, 10_000, readers({
+    const summary = runReaperIfPresent(admission, 10_000, processEvidence({
       processState: "same",
       processIds: [child.pid]
     }));
@@ -408,7 +436,7 @@ describe("S3-T14 heartbeat suspect and runtime reaper", () => {
     const child7 = identitiesForSlot(7).child;
     const child8 = identitiesForSlot(8).child;
     const child9 = identitiesForSlot(9).child;
-    const summary = runReaperIfPresent(admission, 10_000, readers({
+    const summary = runReaperIfPresent(admission, 10_000, processEvidence({
       processState: "same",
       processIds: [child7.pid, child8.pid, child9.pid]
     }));
@@ -430,7 +458,7 @@ describe("S3-T14 heartbeat suspect and runtime reaper", () => {
     const admission = controller();
     const lease = makeExpiredActiveLease(admission);
 
-    const summary = runReaperIfPresent(admission, 10_000, readers({
+    const summary = runReaperIfPresent(admission, 10_000, processEvidence({
       processState: "unverifiable",
       processIds: [identitiesForSlot(9).child.pid]
     }));
