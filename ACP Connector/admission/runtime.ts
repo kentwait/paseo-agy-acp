@@ -1,8 +1,10 @@
 import { closeSync, lstatSync, openSync } from "node:fs";
+import { AdmissionController } from "../../Admission Controller/controller.js";
 import {
-  AdmissionController,
-  type AdmissionRuntimeReaperReaders
-} from "../../Admission Controller/controller.js";
+  createLinuxProcessEvidence,
+  requireProcessEvidence,
+  type ProcessEvidence
+} from "../../Admission Controller/process-evidence.js";
 import { loadOrCreateAdmissionKey } from "../../Admission Controller/key-store.js";
 import {
   deriveAdmissionKeyBundle,
@@ -14,16 +16,13 @@ import {
   type AdmissionRuntimeEnvironment,
   type EnabledAdmissionRuntimeConfig
 } from "../../Admission Controller/runtime-config.js";
-import {
-  nativeAdmissionStartupRecoveryReaders,
-  recoverExitedAdmissionSeats
-} from "./startup-recovery.js";
+import { recoverExitedAdmissionSeats } from "./startup-recovery.js";
 
 const DEFAULT_RUNTIME_REAPER_INTERVAL_MS = 1_000;
 const MAX_RUNTIME_REAPER_INTERVAL_MS = 4_000;
 
 export interface AdmissionRuntimeOptions {
-  readonly reaperReaders?: AdmissionRuntimeReaperReaders;
+  readonly processEvidence?: ProcessEvidence;
   readonly reaperIntervalMs?: number;
   readonly now?: () => number;
 }
@@ -37,7 +36,7 @@ export class AdmissionRuntimeError extends Error {
 
 export class AdmissionRuntime {
   readonly #controller: AdmissionController;
-  readonly #reaperReaders: AdmissionRuntimeReaperReaders;
+  readonly #processEvidence: ProcessEvidence;
   readonly #readNow: () => number;
   #reaperTimer: ReturnType<typeof setInterval> | undefined;
   #reaping = false;
@@ -45,7 +44,7 @@ export class AdmissionRuntime {
 
   constructor(controller: AdmissionController, options: AdmissionRuntimeOptions = {}) {
     this.#controller = controller;
-    this.#reaperReaders = options.reaperReaders ?? nativeAdmissionStartupRecoveryReaders;
+    this.#processEvidence = requireProcessEvidence(options.processEvidence ?? controller.processEvidence);
     this.#readNow = options.now ?? Date.now;
     const intervalMs = normalizeReaperIntervalMs(options.reaperIntervalMs);
     this.#reaperTimer = setInterval(() => this.reapOnce(), intervalMs);
@@ -55,6 +54,11 @@ export class AdmissionRuntime {
   get controller(): AdmissionController {
     this.assertOpen();
     return this.#controller;
+  }
+
+  get processEvidence(): ProcessEvidence {
+    this.assertOpen();
+    return this.#processEvidence;
   }
 
   close(): void {
@@ -75,7 +79,7 @@ export class AdmissionRuntime {
     if (this.#closed || this.#reaping) return;
     this.#reaping = true;
     try {
-      this.#controller.reapSuspects(readNow(this.#readNow), this.#reaperReaders);
+      this.#controller.reapSuspects(readNow(this.#readNow), this.#processEvidence);
     } catch {
       // Reaper evidence is best-effort and fail-closed; startup recovery remains separate.
     } finally {
@@ -95,6 +99,7 @@ export function createAdmissionRuntime(
 
   rejectUnsafeExistingDatabase(config.databasePath);
   const key = loadOrCreateAdmissionKey(config.stateDir);
+  const processEvidence = requireProcessEvidence(options.processEvidence ?? createLinuxProcessEvidence());
   let derivedKeys: AdmissionKeyBundle | undefined;
   let controller: AdmissionController | undefined;
   try {
@@ -104,11 +109,12 @@ export function createAdmissionRuntime(
       databasePath: config.databasePath,
       policy: config.policy,
       encryptionKey: derivedKeys.encryption,
-      contentFingerprintKey: derivedKeys.contentFingerprint
+      contentFingerprintKey: derivedKeys.contentFingerprint,
+      processEvidence
     });
     controller.claimDurablePolicy(config.policy, config.agentId, Date.now());
-    recoverExitedAdmissionSeats(controller);
-    return new AdmissionRuntime(controller, options);
+    recoverExitedAdmissionSeats(controller, { processEvidence });
+    return new AdmissionRuntime(controller, { ...options, processEvidence });
   } catch (error) {
     try {
       controller?.close();

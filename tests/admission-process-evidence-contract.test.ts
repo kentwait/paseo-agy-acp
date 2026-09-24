@@ -10,15 +10,14 @@ import {
 } from "../Admission Controller/controller.js";
 import {
   captureLinuxProcessIdentity,
+  createLinuxProcessEvidence,
   inspectLinuxProcessGroup,
   observeLinuxProcessIdentity,
   type LinuxProcessEvidenceReaders,
-  type LinuxProcessIdentity
+  type LinuxProcessIdentity,
+  type ProcessEvidence
 } from "../Admission Controller/process-evidence.js";
-import {
-  recoverExitedAdmissionSeats,
-  type AdmissionStartupRecoveryReaders
-} from "../ACP Connector/admission/startup-recovery.js";
+import { recoverExitedAdmissionSeats } from "../ACP Connector/admission/startup-recovery.js";
 
 const BOOT_ID = "f4bca3da-9bd5-4f2e-89b8-5e12e5ee8f31";
 const REUSED_BOOT_ID = "f4bca3da-9bd5-4f2e-89b8-5e12e5ee8f32";
@@ -119,27 +118,29 @@ function processEvidenceReaders(
   };
 }
 
-function recoveryReaders(options: {
+function recoveryEvidence(options: {
   connector: "same" | "gone";
   child: "same" | "gone";
   processIds: readonly number[];
-}): AdmissionStartupRecoveryReaders {
-  return {
+}): ProcessEvidence {
+  return createLinuxProcessEvidence({
     listProcessIds() {
       return options.processIds;
     },
-    readFile(filePath) {
-      if (filePath === "/proc/sys/kernel/random/boot_id") return `${BOOT_ID}\n`;
-      if (filePath === `/proc/${CONNECTOR.pid}/stat`) return processStatOrGone(CONNECTOR, options.connector);
-      if (filePath === `/proc/${CHILD.pid}/stat`) return processStatOrGone(CHILD, options.child);
-      throw Object.assign(new Error("gone"), { code: "ENOENT" });
-    },
-    readLink(filePath) {
-      if (filePath === `/proc/${CONNECTOR.pid}/ns/pid`) return namespaceOrGone(CONNECTOR, options.connector);
-      if (filePath === `/proc/${CHILD.pid}/ns/pid`) return namespaceOrGone(CHILD, options.child);
-      throw Object.assign(new Error("gone"), { code: "ENOENT" });
+    readers: {
+      readFile(filePath) {
+        if (filePath === "/proc/sys/kernel/random/boot_id") return `${BOOT_ID}\n`;
+        if (filePath === `/proc/${CONNECTOR.pid}/stat`) return processStatOrGone(CONNECTOR, options.connector);
+        if (filePath === `/proc/${CHILD.pid}/stat`) return processStatOrGone(CHILD, options.child);
+        throw Object.assign(new Error("gone"), { code: "ENOENT" });
+      },
+      readLink(filePath) {
+        if (filePath === `/proc/${CONNECTOR.pid}/ns/pid`) return namespaceOrGone(CONNECTOR, options.connector);
+        if (filePath === `/proc/${CHILD.pid}/ns/pid`) return namespaceOrGone(CHILD, options.child);
+        throw Object.assign(new Error("gone"), { code: "ENOENT" });
+      }
     }
-  };
+  });
 }
 
 function processStatOrGone(identity: LinuxProcessIdentity, state: "same" | "gone"): string {
@@ -207,7 +208,7 @@ describe("S3-T13 process evidence contract", () => {
     dispatch(admission);
 
     expect(recoverExitedAdmissionSeats(admission, {
-      readers: recoveryReaders({ connector: "gone", child: "gone", processIds: [] }),
+      processEvidence: recoveryEvidence({ connector: "gone", child: "gone", processIds: [] }),
       now: () => 2_000
     })).toEqual({ inspected: 1, released: 1, retained: 0, markedRecoveryRequired: 0 });
 
