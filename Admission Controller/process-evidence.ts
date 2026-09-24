@@ -33,6 +33,14 @@ export interface ProcessIdentity {
 
 export type LinuxProcessIdentity = ProcessIdentity;
 
+export type ProcessEvidenceFormatVersion = 1;
+export const PROCESS_EVIDENCE_FORMAT_VERSION: ProcessEvidenceFormatVersion = 1;
+
+export interface CanonicalProcessIdentity extends ProcessIdentity {
+  readonly platform: ProcessEvidencePlatform;
+  readonly formatVersion: ProcessEvidenceFormatVersion;
+}
+
 export interface LinuxProcessStatEvidence {
   readonly pid: number;
   readonly startTimeTicks: string;
@@ -88,7 +96,7 @@ export interface LinuxPreDispatchTerminationProof extends LinuxPreDispatchProofP
   readonly proofHmac: string;
 }
 
-export type ProcessEvidencePlatform = "linux";
+export type ProcessEvidencePlatform = "linux" | "darwin";
 
 /** A conservative observation of a persisted process identity. */
 export type ProcessIdentityState = "same" | "gone" | "pid_reused" | "unverifiable";
@@ -153,10 +161,97 @@ export function createLinuxProcessEvidence(options: LinuxProcessEvidenceOptions 
   });
 }
 
+export function serializeProcessIdentity(
+  identity: unknown,
+  platform: ProcessEvidencePlatform
+): string {
+  if (!isProcessEvidencePlatform(platform)) {
+    throw new ProcessEvidenceError("process evidence platform is invalid");
+  }
+  const normalized = normalizeIdentity(identity);
+  if (normalized === null) throw new ProcessEvidenceError("process identity is invalid");
+  return JSON.stringify({
+    platform,
+    formatVersion: PROCESS_EVIDENCE_FORMAT_VERSION,
+    bootId: normalized.bootId,
+    pid: normalized.pid,
+    startTimeTicks: normalized.startTimeTicks,
+    pidNamespaceInode: normalized.pidNamespaceInode,
+    ppid: normalized.ppid,
+    pgrp: normalized.pgrp,
+    session: normalized.session
+  });
+}
+
+export const serializeCanonicalProcessIdentity = serializeProcessIdentity;
+
+export function parseProcessIdentityEnvelope(
+  value: unknown,
+  expectedPlatform?: ProcessEvidencePlatform
+): CanonicalProcessIdentity | null {
+  let parsed: unknown = value;
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+
+  const record = exactRecord(parsed, [
+    "platform",
+    "formatVersion",
+    "bootId",
+    "pid",
+    "startTimeTicks",
+    "pidNamespaceInode",
+    "ppid",
+    "pgrp",
+    "session"
+  ]);
+  if (record === null || !isProcessEvidencePlatform(record.platform)) return null;
+  if (record.formatVersion !== PROCESS_EVIDENCE_FORMAT_VERSION) return null;
+  if (expectedPlatform !== undefined && record.platform !== expectedPlatform) return null;
+
+  const identity = normalizeIdentity(record);
+  if (identity === null) return null;
+  const canonical = serializeProcessIdentity(identity, record.platform);
+  if (typeof value === "string" ? value !== canonical : JSON.stringify(record) !== canonical) return null;
+  return Object.freeze({
+    platform: record.platform,
+    formatVersion: PROCESS_EVIDENCE_FORMAT_VERSION,
+    ...identity
+  });
+}
+
+export function parseProcessIdentity(
+  value: unknown,
+  expectedPlatform?: ProcessEvidencePlatform
+): ProcessIdentity | null {
+  const envelope = parseProcessIdentityEnvelope(value, expectedPlatform);
+  if (envelope === null) return null;
+  return Object.freeze({
+    bootId: envelope.bootId,
+    pid: envelope.pid,
+    startTimeTicks: envelope.startTimeTicks,
+    pidNamespaceInode: envelope.pidNamespaceInode,
+    ppid: envelope.ppid,
+    pgrp: envelope.pgrp,
+    session: envelope.session
+  });
+}
+
+export const parseCanonicalProcessIdentity = parseProcessIdentity;
+
+export function isProcessEvidencePlatform(value: unknown): value is ProcessEvidencePlatform {
+  return value === "linux" || value === "darwin";
+}
+
 export function requireProcessEvidence(value: unknown): ProcessEvidence {
   if (
     typeof value !== "object" ||
     value === null ||
+    !isProcessEvidencePlatform((value as ProcessEvidence).platform) ||
     typeof (value as ProcessEvidence).capture !== "function" ||
     typeof (value as ProcessEvidence).observe !== "function" ||
     typeof (value as ProcessEvidence).inspectProcessGroup !== "function"

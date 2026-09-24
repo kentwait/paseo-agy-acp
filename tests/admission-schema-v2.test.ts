@@ -4,6 +4,10 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  createLinuxProcessEvidence,
+  type ProcessEvidence
+} from "../Admission Controller/process-evidence.js";
+import {
   AdmissionController,
   AdmissionMigrationError,
   type AdmissionPolicy,
@@ -61,12 +65,35 @@ function databasePath(): string {
   return path.join(stateDir, "runtime.sqlite");
 }
 
+function processEvidence(): ProcessEvidence {
+  return createLinuxProcessEvidence({
+    listProcessIds: () => [],
+    readers: {
+      readFile(path) {
+        if (path === "/proc/sys/kernel/random/boot_id") return "f4bca3da-9bd5-4f2e-89b8-5e12e5ee8f31\n";
+        if (path === `/proc/${process.pid}/stat`) {
+          const fields = [
+            "S", "1", String(process.pid), String(process.pid), "0", "-1", "4194560", "1", "0", "0", "0", "4", "2", "0", "0", "20", "0", "1", "0", "100", "0", "0"
+          ];
+          return `${process.pid} (test) ${fields.join(" ")}\n`;
+        }
+        throw Object.assign(new Error("gone"), { code: "ENOENT" });
+      },
+      readLink(path) {
+        if (path === `/proc/${process.pid}/ns/pid`) return "pid:[4026531836]";
+        throw Object.assign(new Error("gone"), { code: "ENOENT" });
+      }
+    }
+  });
+}
+
 function openController(file: string): AdmissionController {
   const admission = new AdmissionController({
     databasePath: file,
     policy: POLICY,
     encryptionKey: Buffer.alloc(32, 81),
-    contentFingerprintKey: Buffer.alloc(32, 82)
+    contentFingerprintKey: Buffer.alloc(32, 82),
+    processEvidence: processEvidence()
   });
   controllers.push(admission);
   return admission;
@@ -248,8 +275,8 @@ afterEach(() => {
   for (const stateDir of stateDirs.splice(0)) rmSync(stateDir, { recursive: true, force: true });
 });
 
-describe("Admission schema v2 migration", () => {
-  it("migrates a legacy v1 database to the exact v2 shape without changing sessions", () => {
+describe("Admission schema v4 migration", () => {
+  it("migrates a legacy v1 database to the exact v4 shape without changing sessions", () => {
     const file = databasePath();
     createLegacyV1Database(file);
     const before = new Database(file, { readonly: true });
@@ -263,8 +290,8 @@ describe("Admission schema v2 migration", () => {
       db.pragma("foreign_keys = ON");
       const sqliteVersion = db.prepare("SELECT sqlite_version() AS version").get() as { version: string };
       expect(sqliteVersion.version.localeCompare("3.25.0", undefined, { numeric: true })).toBeGreaterThanOrEqual(0);
-      expect(ADMISSION_SCHEMA_VERSION).toBe(3);
-      expect(admission.schemaVersion).toBe(3);
+      expect(ADMISSION_SCHEMA_VERSION).toBe(4);
+      expect(admission.schemaVersion).toBe(4);
       expect(() => assertAdmissionSchemaIntegrity(db)).not.toThrow(SchemaIntegrityError);
       expect(tableNames(db)).toEqual([
         "cooldowns",
@@ -313,6 +340,18 @@ describe("Admission schema v2 migration", () => {
         "suspect_since",
         "suspect_reason"
       ]);
+      expect(columnNames(db, "lease_process_identities")).toEqual([
+        "lease_id",
+        "request_id",
+        "lease_generation",
+        "owner_instance_id",
+        "prompt_channel",
+        "connector_owner_instance_id",
+        "connector_created_at",
+        "connector_evidence_json",
+        "child_evidence_json",
+        "recorded_at"
+      ]);
       expect(columnNames(db, "policy_state")).toEqual([
         "id",
         "max_active_turns",
@@ -323,7 +362,8 @@ describe("Admission schema v2 migration", () => {
         "drain_state",
         "policy_fingerprint",
         "updated_at",
-        "updated_by_owner_instance_id"
+        "updated_by_owner_instance_id",
+        "process_evidence_platform"
       ]);
       expect(columns(db, "policy_state").find((column) => column.name === "policy_fingerprint")).toMatchObject({
         type: "TEXT",
@@ -334,20 +374,15 @@ describe("Admission schema v2 migration", () => {
       expect(columnNames(db, "queued_owner_instances")).toEqual([
         "owner_instance_id",
         "created_at",
-        "boot_id",
-        "pid",
-        "start_time_ticks",
-        "pid_namespace_inode",
-        "ppid",
-        "pgrp",
-        "session",
+        "queued_owner_evidence_json",
         "recorded_at"
       ]);
       expect(foreignKeys(db, "queued_owner_instances")).toEqual([]);
       expect(db.prepare("SELECT version, name FROM schema_migrations ORDER BY version ASC").all()).toEqual([
         { version: 1, name: "shared-admission-queue" },
         { version: 2, name: "shared-admission-queue-v2" },
-        { version: 3, name: "shared-admission-queue-v3" }
+        { version: 3, name: "shared-admission-queue-v3" },
+        { version: 4, name: "shared-admission-queue-v4" }
       ]);
       expect(sessionLayout(db)).toEqual(beforeSessions);
       expect(() => assertLegacyConnectorRejects(file, 1)).toThrow(/newer than this connector supports/);
@@ -413,7 +448,7 @@ describe("Admission schema v2 migration", () => {
     }
   });
 
-  it("rolls back the v2 DDL transaction if migration fails after the rename point", () => {
+  it("rolls back the v4 DDL transaction if migration fails after the rename point", () => {
     const file = databasePath();
     createLegacyV1Database(file);
     const conflict = new Database(file);

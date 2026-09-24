@@ -10,6 +10,7 @@ import {
 } from "../Admission Controller/controller.js";
 import {
   createLinuxProcessEvidence,
+  parseProcessIdentity,
   type LinuxProcessEvidenceReaders,
   type ProcessEvidence,
   type ProcessGroupState,
@@ -169,9 +170,9 @@ function leaseIdentityChildPid(admission: AdmissionController, requestId: string
   const database = new Database(admission.databasePath, { readonly: true });
   try {
     const row = database
-      .prepare("SELECT child_pid AS childPid FROM lease_process_identities WHERE request_id = ?")
-      .get(requestId) as { childPid: number } | undefined;
-    return row?.childPid ?? null;
+      .prepare("SELECT child_evidence_json AS childEvidence FROM lease_process_identities WHERE request_id = ?")
+      .get(requestId) as { childEvidence: string } | undefined;
+    return parseProcessIdentity(row?.childEvidence, "linux")?.pid ?? null;
   } finally {
     database.close();
   }
