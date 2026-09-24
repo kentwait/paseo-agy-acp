@@ -2,6 +2,23 @@
 
 All notable changes to `paseo-agy-acp` are recorded here.
 
+## 2.3.2 - 2026-09-24
+
+### Fixed
+
+- Pass `--uid=` only when spawning a direct official `.par` on Linux. Darwin
+  builds reject that flag at startup.
+
+### Verification
+
+- Complete validation: 37 test files, 217 passed, 1 skipped; architecture and
+  secret checks passed. Spawn args are pinned for `linux`, `darwin`, and `win32`.
+
+### Contributors
+
+- Thanks to [@zwmmm](https://github.com/zwmmm) for the Linux-only `--uid=` fix
+  in [#12](https://github.com/tiezbro/paseo-agy-acp/pull/12).
+
 ## 2.3.1 - 2026-08-31
 
 ### Fixed
