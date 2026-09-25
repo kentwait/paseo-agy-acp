@@ -64,8 +64,9 @@ session cwd 隔离，并发 workspace 不会互相泄漏命令元数据。
 未修改的官方 ACP 路径默认以 Gemini 系模型为工作集合。已获得 Claude 4.6 或
 GPT-OSS 120B 资格的账号，可以按
 [官方内核兼容 runbook](docs/operations/official-kernel-compat-runbook.md)
-显式启用本机兼容生命周期。推理仍由同一套官方内核和 Google backend 负责；本仓库
-不打包也不替换它们。
+显式启用仅限 Linux 的官方内核兼容生命周期。该生命周期与 macOS Admission
+支持彼此独立。推理仍由同一套官方内核和 Google backend 负责；本仓库不打包也不
+替换它们。
 
 <!-- readme:architecture -->
 ## 架构与职责
@@ -95,7 +96,8 @@ Antigravity 账号服务多个并发 Paseo agent 时建议启用。
 - **Node.js 22 或更新版本**
 - 本机已安装的官方 Antigravity ACP kernel wrapper 或 `.par`
 - 可以完成官方 `oauth-personal` 的 Antigravity 账号
-- 启用 Admission 时，系统需支持 Linux 文件 owner 与 mode
+- Admission 支持 Linux，以及 macOS `arm64` 和 `x64` 主机。Admission 默认保持禁用；
+  其他操作系统在显式启用时会 fail closed。
 
 除非官方内核已经位于维护者主机默认 pin 路径，否则必须设置
 `PASEO_AGY_ACP_OFFICIAL_BIN`。若它直接指向 `.par`，适配器会从该文件所在目录
@@ -115,7 +117,7 @@ OAuth 由官方内核完成。Token 保留在内核自己的状态中，本适�
 
 ### 2. 准备 Admission 状态
 
-单 agent 可以不启用 Admission；多 agent 委派建议启用。
+隔离的单 agent 可以不启用 Admission；多 agent 委派建议启用。
 
 ```bash
 export AGY_ACP_STATE_DIR="$HOME/.local/state/paseo-agy-acp/account-name"
@@ -124,8 +126,11 @@ npx -y --package=paseo-agy-acp@2.3.2 \
   agy-acp-prepare-state "$AGY_ACP_STATE_DIR"
 ```
 
-每个 Antigravity 账号使用一个 owner-only 状态目录。预检会创建或验证目录，并拒绝
-已经存在的宽权限路径。
+每个 Antigravity 账号使用一个全新的 owner-only 账号状态根。预检只创建或验证
+该状态根，并要求权限精确为 `0700`。Admission 首次打开状态根时，才会创建嵌套
+`official-kernel` ledger 目录，目录权限为 `0700`；其中的新状态文件使用 `0600`
+权限。该 ledger 属于宿主机本地且绑定平台：不要在主机或操作系统之间复制。请
+配置账号状态根，不要直接配置嵌套目录。
 
 ### 3. 配置 Paseo provider
 
@@ -140,7 +145,7 @@ npx -y --package=paseo-agy-acp@2.3.2 \
       "env": {
         "PASEO_AGY_ACP_OFFICIAL_BIN": "/absolute/path/to/agy-acp-server-wrapper-or.par",
         "AGY_ACP_ADMISSION_ENABLED": "true",
-        "AGY_ACP_STATE_DIR": "/home/YOU/.local/state/paseo-agy-acp/account-name"
+        "AGY_ACP_STATE_DIR": "/absolute/path/to/owner-only-account-state"
       }
     }
   }
@@ -148,7 +153,9 @@ npx -y --package=paseo-agy-acp@2.3.2 \
 ```
 
 Paseo 会向 provider 进程提供 `PASEO_AGENT_ID` 和 `PASEO_AGENT_CWD`。只有在明确
-需要不受 Admission 约束的单 agent 运行时，才省略两个 Admission 变量。
+需要不受 Admission 约束的单 agent 运行时，才省略两个 Admission 变量。尚未获得
+agent identity 的 provider Discovery 与 `--login` 不会初始化 Admission，也不会
+创建其嵌套 ledger。
 
 ### 4. 重启并验证
 
@@ -168,8 +175,9 @@ Paseo 会向 provider 进程提供 `PASEO_AGENT_ID` 和 `PASEO_AGENT_CWD`。只�
 | `AGY_ACP_ADMISSION_ENABLED` | `true` / `1` 启用 prompt fence |
 | `AGY_ACP_STATE_DIR` | 一个账号共享的 owner-only 绝对状态目录 |
 
-高级席位、启动限速、排队超时、cooldown、权限、恢复和 policy 变更流程见
-[Admission 运维](docs/operations/admission.md)。
+高级平台、native loading、席位、启动限速、排队超时、cooldown、权限、恢复和
+policy 变更流程见 [Admission operations](docs/operations/admission.md) 与
+[Admission 运维](docs/operations/admission.zh-CN.md)。
 
 ### Mode 映射
 
@@ -196,15 +204,19 @@ Agents/Codex 目录和全局 Gemini/Agents/Codex 目录。每个 skill 目录需
 - 官方内核必须已在本机安装；`npx` 只安装代理。
 - npm 首次运行可能编译 `better-sqlite3`，需要本机 C++ 工具链。
 - 修改 provider command、环境变量或内核路径后要重启 Paseo。
-- 已启用 Admission 但 identity 缺失、状态权限不安全或 policy 非法时，系统拒绝启动，
-  不会静默变成 unfenced 运行。
+- 已启用 Admission 但 identity 缺失、状态不安全、证据损坏、policy mismatch、
+  平台不支持或 native artifact 有问题时，系统拒绝启动，不会静默变成 unfenced
+  运行。
+- 恢复流程绝不重放结果不确定的 prompt。不要通过编辑或删除 ledger 强行启动或
+  释放席位。
 - 工具质量、生图、backend 配额与 provider 错误文案仍由官方内核和 Google backend
   负责。
 - 可复现升级或回滚应在 provider command 中固定三段 npm 版本，然后重启 Paseo。
 
 当前运维入口：
 
-- [Admission 运维](docs/operations/admission.md)
+- [Admission operations](docs/operations/admission.md)
+- [Admission 运维](docs/operations/admission.zh-CN.md)
 - [Claude / GPT-OSS 本机兼容](docs/operations/official-kernel-compat-runbook.md)
 - [npm Trusted Publishing](docs/operations/npm-publishing.md)
 - [Changelog](CHANGELOG.md)
@@ -231,8 +243,9 @@ npm run build:native
 npm run test:native:source
 ```
 
-源码回退产物写入被忽略的 `build/Release/`；安装包会按主机选择已经审核的
-`prebuilds/darwin-arm64` 或 `prebuilds/darwin-x64` Node-API artifact。维护者可用
+源码回退产物写入被忽略的 `build/Release/`；安装包会按实际 Node 平台和架构选择
+已经审核的 `prebuilds/darwin-arm64` 或 `prebuilds/darwin-x64` Node-API
+artifact。源码构建不是安装包的自动回退。维护者可用
 `npm run build:native:prebuild:arm64` 或 `npm run build:native:prebuild:x64`
 重新生成对应 artifact。Apple Silicon 主机可以交叉编译 x64 artifact，但执行其
 native contract 仍需要 Intel Mac 或 x64 Rosetta 环境。安装包测试可从

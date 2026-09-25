@@ -1,20 +1,35 @@
 # Admission operations
 
+[English](./admission.md) | [中文](./admission.zh-CN.md)
+
 Admission protects one Antigravity account from prompt bursts created by
 multi-agent Paseo delegation. It is a durable, account-wide fence around the
 official kernel's `session/prompt` write. It does not replace Paseo scheduling
 or the official ACP session lifecycle.
 
+## Platform support and default behavior
+
+Admission is supported on Linux and macOS `arm64` and `x64` hosts. Admission
+remains disabled by default; set `AGY_ACP_ADMISSION_ENABLED` to `true` or `1`
+only when account-wide queueing, shared seats, startup recovery, and runtime
+reaping are required. Running without Admission is appropriate only for a
+deliberately isolated single agent.
+
+Other operating systems are unsupported for enabled Admission. They fail
+closed rather than running an official-kernel prompt without the configured
+queue guarantees. The separate Linux-only official-kernel compatibility
+lifecycle for Claude and GPT-OSS is not part of macOS Admission support.
+
 ## When to enable it
 
 Enable Admission when multiple Paseo agents can use the same Antigravity
-account concurrently. A deliberately isolated single-agent connector can run
-without it.
+account concurrently. All connector processes for one account on one host must
+use the same `AGY_ACP_STATE_DIR` and identical policy. Different accounts must
+use different account state roots.
 
-All connector processes that share one account must use the same
-`AGY_ACP_STATE_DIR`. Different accounts should use different directories.
+## Prepare a fresh account state root
 
-## Prepare the state directory
+Choose a new, unused root for each Antigravity account:
 
 ```bash
 export AGY_ACP_STATE_DIR="$HOME/.local/state/paseo-agy-acp/account-name"
@@ -24,20 +39,46 @@ npx -y --package=paseo-agy-acp@2.3.2 \
 export AGY_ACP_ADMISSION_ENABLED=true
 ```
 
-The preflight requires an absolute path owned by the current user with exact
-`0700` permissions. It creates new state files with `0600` permissions. An
-existing directory with wider permissions is rejected rather than silently
-changed; inspect its owner and contents before running:
+The preflight creates or validates only the account state root. It requires an
+absolute path owned by the current user with exact `0700` permissions and
+rejects an existing directory with wider permissions rather than silently
+changing it. When enabled Admission first opens the root, it creates the nested
+ledger directory with `0700` permissions and new owner-only state files with
+`0600` permissions.
+
+The nested `official-kernel` ledger is created below
+`$AGY_ACP_STATE_DIR/official-kernel`. Configure the account state root, not the
+nested directory. Admission state is host-local and platform-bound: never copy
+a live or existing ledger to another machine, from Linux to macOS, or from
+macOS to Linux. Preserve the old root when changing policy or platform.
+
+## Verify ownership and permissions
+
+On Linux, inspect the account state root with:
 
 ```bash
-chmod 700 -- "$AGY_ACP_STATE_DIR"
+stat -c '%U %a %n' "$AGY_ACP_STATE_DIR"
+```
+
+On macOS, use:
+
+```bash
+stat -f '%Su %Lp %N' "$AGY_ACP_STATE_DIR"
+```
+
+The path must be absolute, its owner must match the connector user, and its
+mode must be `700`. After confirming that the path is the intended account
+root, repair ownership or mode and rerun the preflight:
+
+```bash
+sudo chown "$(id -un)" "$AGY_ACP_STATE_DIR"
+chmod 700 "$AGY_ACP_STATE_DIR"
 npx -y --package=paseo-agy-acp@2.3.2 \
   agy-acp-prepare-state "$AGY_ACP_STATE_DIR"
 ```
 
-The official-kernel ledger lives below
-`$AGY_ACP_STATE_DIR/official-kernel`. Do not copy a live ledger between
-accounts or edit its SQLite files manually.
+Do not recursively change ownership or permissions until the account and path
+have been verified.
 
 ## Required runtime identity
 
@@ -45,10 +86,14 @@ An enabled connector requires:
 
 - `AGY_ACP_ADMISSION_ENABLED=true` or `1`;
 - an absolute, prepared `AGY_ACP_STATE_DIR`;
-- a valid `PASEO_AGENT_ID` supplied by Paseo.
+- a valid `PASEO_AGENT_ID` supplied by Paseo;
+- a supported evidence platform and a healthy host-matching native artifact on
+  macOS.
 
-Missing or malformed enabled configuration fails closed. Discovery and
-`--login` paths without an agent id do not open the Admission ledger.
+Missing or malformed enabled configuration fails closed. Provider Discovery
+before Paseo supplies `PASEO_AGENT_ID` does not open the Admission ledger or
+load process evidence. `--login` does not initialize Admission or create the
+nested ledger; official OAuth state remains owned by the official kernel.
 
 ## Policy defaults
 
@@ -84,14 +129,53 @@ other failures retain distinct classifications.
 
 ## Persistence and recovery
 
-Policy, queued ownership, leases, and recovery state are persisted so separate
-connector processes share one account pool. Startup recovery verifies process
-identity before reclaiming capacity. Ambiguous writes become explicit recovery
-states; the adapter does not silently replay a prompt whose delivery cannot be
-proven.
+Policy, queued ownership, leases, and recovery state are persisted in the
+host-local, platform-bound nested ledger so separate connector processes on
+one host share one account pool. Startup recovery and the runtime reaper use
+the same selected process-evidence adapter. They verify connector, child,
+process-group, descendant, and PID-reuse evidence before reclaiming local
+capacity.
 
-Do not delete the state directory while connectors are running. Back up or
-inspect it only when every connector using the account is stopped.
+Heartbeat expiry is only a suspicion signal. Missing, malformed, inaccessible,
+incomplete, or ambiguous evidence is `unverifiable` and retains the local seat.
+Do not delete or edit the state directory to force startup. Back up or inspect
+it only when every connector using the account is stopped.
+
+## Native artifact selection and source-build fallback
+
+The Darwin loader selects by actual Node runtime platform and architecture, not
+by a guessed Mac model. Check the runtime target with:
+
+```bash
+node -p '`${process.platform}/${process.arch}`'
+```
+
+| Runtime target | Selected evidence implementation |
+|---|---|
+| `darwin/arm64` | `prebuilds/darwin-arm64/darwin_process_evidence.node` |
+| `darwin/x64` | `prebuilds/darwin-x64/darwin_process_evidence.node` |
+| `linux/*` | Linux procfs evidence; no Darwin prebuild is loaded |
+
+An x64 Node process under Rosetta therefore expects the reviewed x64 prebuild.
+A missing, unreadable, invalid, or architecture-mismatched artifact is an
+actionable startup error. Record the expected platform, actual platform,
+expected architecture, actual architecture, and attempted artifact path, then
+reinstall the same pinned package on the supported host. Do not copy an
+artifact from another architecture.
+
+The source-build fallback is for a source checkout with Xcode Command Line
+Tools, not an automatic repair for an installed package:
+
+```bash
+npm run build:native
+npm run test:native:source
+```
+
+The source build is written to `build/Release/` and is tested separately from
+installed-package prebuild consumption. Contributors may use it to reproduce
+the native process-evidence contract locally; operators should reinstall the
+reviewed host-matching package instead of shipping or copying a locally built
+artifact.
 
 ## Changing policy
 
@@ -112,38 +196,88 @@ Keep the previous directory untouched until the new policy has passed live
 verification. Switching the provider environment back to the previous path is
 the rollback.
 
-## Troubleshooting
+## Safe troubleshooting
+
+Stop additional dispatch for the affected account before inspecting durable
+state. Preserve the account state root and collect only sanitized errors,
+runtime target, policy values, owner names, and process status. Never include
+prompt payloads, credentials, OAuth state, or encrypted database contents in an
+issue.
 
 ### Connector refuses to start
 
-Check:
+Check the configured path, runtime target, and supplied agent identity:
 
 ```bash
 printf '%s\n' "$AGY_ACP_STATE_DIR"
-stat -c '%U %a %n' "$AGY_ACP_STATE_DIR"
+node -p '`${process.platform}/${process.arch}`'
 printf '%s\n' "$PASEO_AGENT_ID"
 ```
 
-The path must be absolute, owner must match the connector user, permissions
-must be `700`, and every numeric policy value must satisfy the table above.
+Then use the Linux or macOS ownership command from the setup section. The path
+must be absolute, owner must match the connector user, mode must be `700`, and
+every numeric policy value must satisfy the policy table.
 
 ### Policy mismatch
 
-Stop all account connectors and confirm they use identical Admission
-environment. Do not overwrite the persisted fingerprint. Use a newly prepared
-state directory for the new policy.
+Stop all connectors using the account and confirm they have identical Admission
+environment. A policy mismatch means the same local ledger was opened with a
+different normalized policy. Preserve the old ledger; do not overwrite its
+fingerprint. When the transition is intentional, prepare a fresh account state
+root, start one connector, verify a simple turn, and then restore normal
+dispatch.
+
+### Platform mismatch or unsupported operating system
+
+A platform mismatch means Linux-owned state was opened on macOS or macOS-owned
+state was opened on Linux. An unsupported operating system with Admission
+explicitly enabled must also fail closed. Do not edit the stored platform tag
+or evidence JSON. Keep unsupported platforms deliberately unfenced only for
+an intentionally isolated single agent, or transition on a supported host with
+a fresh local account state root.
+
+### Malformed or unverifiable evidence
+
+Malformed durable evidence or malformed platform-tagged JSON fails closed at
+startup; preserve the ledger for diagnosis and do not replace the row by hand.
+Inaccessible or incomplete live process evidence is `unverifiable`: retain the
+local seat and retry observation later. Never treat `ps` output, PID existence,
+or a timeout as proof that a process or turn is gone.
 
 ### Work remains queued
 
-Check active agents, queue timeout, configured seats, start spacing, and recent
-provider-capacity failures. Do not raise limits until authentication, quota,
-and kernel health are known.
+Check active agents, queue timeout, configured seats, start spacing, owner
+liveness, and recent provider-capacity failures. Do not raise limits until
+authentication, quota, native evidence, and official-kernel health are known.
 
-### Recovery required
+### Recovery states
 
-Stop additional dispatch for the affected account and preserve the ledger.
-Collect the connector error, agent id, state path, and relevant process status
-without copying prompt payloads or credentials into an issue.
+#### Queued-owner cancellation
+
+If a connector owner is proven gone or its PID is proven reused before dispatch,
+startup recovery or the runtime reaper changes the queued request to
+`cancelled` and removes its protected payload. No business prompt write
+occurred, and the request does not occupy a seat.
+
+#### `recovery_required`
+
+If delivery or local process state is ambiguous, the request remains visibly
+`recovery_required`. This is not reported as provider success, known provider
+failure, or a completed turn.
+
+#### Local seat release
+
+A local seat is released only after the connector and child are proven gone or
+their PIDs are proven reused and the expected process group is verifiably
+empty. The request remains `recovery_required`; local resource reconciliation
+does not claim a remote provider outcome.
+
+#### No-replay guarantee
+
+Admission never replays the original business prompt after ambiguous delivery.
+There is no manual requeue or second-delivery path for `recovery_required`.
+If an operator intentionally starts the work again, submit a new user request;
+do not edit SQLite or reuse internal recovery state as a replay mechanism.
 
 ## Security boundary
 

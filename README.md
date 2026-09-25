@@ -72,10 +72,11 @@ each other.
 
 The unmodified official ACP path uses Gemini-family models as its default
 working set. Accounts entitled to Claude 4.6 or GPT-OSS 120B can opt into the
-local compatibility lifecycle documented in the
+Linux-only official-kernel compatibility lifecycle documented in the
 [official-kernel compatibility runbook](docs/operations/official-kernel-compat-runbook.md).
-The same official kernel and Google backend remain responsible for inference;
-this repository does not vendor or replace them.
+That lifecycle is separate from macOS Admission support. The same official
+kernel and Google backend remain responsible for inference; this repository
+does not vendor or replace them.
 
 <!-- readme:architecture -->
 ## Architecture and ownership
@@ -106,7 +107,9 @@ Paseo agents.
 - **Node.js 22 or newer**
 - A locally installed official Antigravity ACP kernel wrapper or `.par`
 - An Antigravity account able to complete official `oauth-personal`
-- Linux filesystem ownership and mode support when Admission is enabled
+- Admission is supported on Linux and macOS `arm64` and `x64` hosts. Admission
+  remains disabled by default; other operating systems fail closed when it is
+  explicitly enabled.
 
 Set `PASEO_AGY_ACP_OFFICIAL_BIN` unless the kernel already exists at the
 maintainer-host default pin. If this variable points directly at a `.par`, the
@@ -128,8 +131,8 @@ own state and are not printed by this adapter.
 
 ### 2. Prepare Admission state
 
-Admission is optional for a single agent and recommended for multi-agent
-delegation.
+Admission is optional for an isolated single agent and recommended for
+multi-agent delegation.
 
 ```bash
 export AGY_ACP_STATE_DIR="$HOME/.local/state/paseo-agy-acp/account-name"
@@ -138,8 +141,13 @@ npx -y --package=paseo-agy-acp@2.3.2 \
   agy-acp-prepare-state "$AGY_ACP_STATE_DIR"
 ```
 
-Use one owner-only state directory per Antigravity account. The preflight
-creates or validates the directory and refuses an existing permissive path.
+Use a fresh owner-only account state root for each Antigravity account. The
+preflight creates or validates only that root and requires exact `0700`
+permissions. When Admission first opens it, the nested `official-kernel` ledger
+directory is created with `0700` permissions and its new state files with
+`0600` permissions. The ledger is host-local and platform-bound: do not copy it
+between hosts or operating systems. Configure the account root rather than the
+nested directory.
 
 ### 3. Configure the Paseo provider
 
@@ -155,7 +163,7 @@ Add or update the provider in `$PASEO_HOME/config.json` or
       "env": {
         "PASEO_AGY_ACP_OFFICIAL_BIN": "/absolute/path/to/agy-acp-server-wrapper-or.par",
         "AGY_ACP_ADMISSION_ENABLED": "true",
-        "AGY_ACP_STATE_DIR": "/home/YOU/.local/state/paseo-agy-acp/account-name"
+        "AGY_ACP_STATE_DIR": "/absolute/path/to/owner-only-account-state"
       }
     }
   }
@@ -164,7 +172,8 @@ Add or update the provider in `$PASEO_HOME/config.json` or
 
 Paseo supplies `PASEO_AGENT_ID` and `PASEO_AGENT_CWD` to the provider process.
 Omit the two Admission variables only when you intentionally want unfenced
-single-agent operation.
+single-agent operation. Provider discovery before an agent identity is supplied
+and `--login` do not initialize Admission or create its nested ledger.
 
 ### 4. Restart and verify
 
@@ -184,8 +193,10 @@ Paseo; it is not a standalone chat application.
 | `AGY_ACP_ADMISSION_ENABLED` | `true` / `1` enables the prompt fence |
 | `AGY_ACP_STATE_DIR` | Absolute owner-only state directory shared by one account |
 
-Advanced seat, start-rate, queue-timeout, cooldown, permission, recovery, and
-policy-change procedures are in [Admission operations](docs/operations/admission.md).
+Advanced platform, native-loading, seat, start-rate, queue-timeout, cooldown,
+permission, recovery, and policy-change procedures are in
+[Admission operations](docs/operations/admission.md) and
+[Admission 运维](docs/operations/admission.zh-CN.md).
 
 ### Mode mapping
 
@@ -214,8 +225,11 @@ usable name and description.
 - The first npm run may compile `better-sqlite3` and require a local C++
   toolchain.
 - Restart Paseo after changing provider command, environment, or kernel path.
-- Enabled Admission with missing identity, unsafe state permissions, or invalid
-  policy refuses to start instead of silently running unfenced.
+- Enabled Admission with missing identity, unsafe state, malformed evidence,
+  policy mismatch, an unsupported platform, or a native artifact problem fails
+  closed instead of silently running unfenced.
+- Recovery never replays an ambiguous prompt. Do not edit or delete the ledger
+  to force startup or release a seat.
 - Tool quality, image generation, backend quota, and provider error text remain
   owned by the official kernel and Google backend.
 - For reproducible upgrades or rollback, pin a three-part npm version in the
@@ -224,6 +238,7 @@ usable name and description.
 Current operational references:
 
 - [Admission operations](docs/operations/admission.md)
+- [Admission 运维](docs/operations/admission.zh-CN.md)
 - [Claude / GPT-OSS local compatibility](docs/operations/official-kernel-compat-runbook.md)
 - [npm Trusted Publishing](docs/operations/npm-publishing.md)
 - [Changelog](CHANGELOG.md)
@@ -253,8 +268,10 @@ npm run test:native:source
 ```
 
 The source fallback is written to ignored `build/Release/`; installed packages
-use the reviewed `prebuilds/darwin-arm64` or `prebuilds/darwin-x64` Node-API
-artifact selected from the host. Maintainers can regenerate either reviewed
+select the reviewed `prebuilds/darwin-arm64` or
+`prebuilds/darwin-x64` Node-API artifact from the actual Node platform and
+architecture. A source build is not an automatic installed-package fallback.
+Maintainers can regenerate either reviewed
 artifact with `npm run build:native:prebuild:arm64` or
 `npm run build:native:prebuild:x64`. An Apple Silicon host can cross-compile the
 x64 artifact, but executing its native contract requires an Intel Mac or x64
