@@ -5,13 +5,21 @@ import {
   assertAdmissionSchemaIntegrity
 } from "./schema.js";
 import {
-  captureLinuxProcessIdentity,
-  inspectLinuxProcessGroup,
-  nativeLinuxProcessEvidenceReaders,
-  observeLinuxProcessIdentity,
-  type LinuxProcessEvidenceReaders,
-  type LinuxProcessIdentityState
+  createLinuxProcessEvidence,
+  requireProcessEvidence,
+  serializeProcessIdentity,
+  type ProcessEvidence,
+  type ProcessEvidencePlatform,
+  type ProcessIdentity,
+  type ProcessIdentityState
 } from "./process-evidence.js";
+import {
+  normalizePlatformProcessIdentity,
+  parsePlatformProcessIdentity,
+  PLATFORM_PROCESS_IDENTITY_KEYS,
+  serializePlatformProcessIdentity,
+  type PlatformProcessIdentity
+} from "./canonical-process-identity.js";
 import {
   isAllowedAdmissionActiveTurns,
   isAllowedAdmissionConcurrentStarts
@@ -24,8 +32,13 @@ export {
 
 const MAX_DISPATCH_CONTENTION_RECHECKS = 500;
 const DISPATCH_CONTENTION_RECHECK_DELAY_MS = 2;
-const MAX_RUNTIME_PID = 2_147_483_647;
 const LEASE_HEARTBEAT_STALE_MS = 4_000;
+const ADMISSION_MIGRATION_NAMES = [
+  "shared-admission-queue",
+  "shared-admission-queue-v2",
+  "shared-admission-queue-v3",
+  "shared-admission-queue-v4"
+] as const;
 
 const dispatchContentionRetrySignal = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 
@@ -42,6 +55,7 @@ export interface AdmissionControllerOptions {
   policy: AdmissionPolicy;
   encryptionKey?: Buffer;
   contentFingerprintKey?: Buffer;
+  processEvidence?: ProcessEvidence<PlatformProcessIdentity>;
   /** Test-only synchronous hook for proving rollback at the atomic dispatch boundary. */
   faultInjection?: AdmissionControllerFaultInjection;
 }
@@ -58,7 +72,7 @@ interface EnqueueRequestBase {
   provider: string;
   model: string;
   now: number;
-  ownerIdentity?: VerifiedLinuxConnectorIdentity;
+  ownerIdentity?: VerifiedConnectorIdentity;
 }
 
 export type EnqueueRequest = EnqueueRequestBase & {
@@ -169,41 +183,47 @@ export type RecoverableDispatchPhase =
   | "active"
   | "recovery_required";
 
-/** Immutable evidence for one Linux process instance. */
-export interface VerifiedLinuxProcessIdentity {
-  bootId: string;
-  pid: number;
-  startTimeTicks: string;
-  pidNamespaceInode: number;
-  ppid: number;
-  pgrp: number;
-  session: number;
-}
+/** Immutable evidence for one process instance. */
+export type VerifiedProcessIdentity = PlatformProcessIdentity;
+
+export type VerifiedLinuxProcessIdentity = ProcessIdentity;
 
 /** Connector owner evidence paired with the connector's stable instance ID. */
-export interface VerifiedLinuxConnectorIdentity extends VerifiedLinuxProcessIdentity {
+export type VerifiedConnectorIdentity = PlatformProcessIdentity & {
   ownerInstanceId: string;
   createdAt: string;
-}
+};
+
+export type VerifiedLinuxConnectorIdentity = ProcessIdentity & {
+  ownerInstanceId: string;
+  createdAt: string;
+};
 
 /** The only process record accepted at the irreversible dispatch boundary. */
-export interface VerifiedLinuxProcessRecord {
+export interface VerifiedProcessRecord {
   requestId: string;
   leaseId: string;
   generation: number;
   ownerInstanceId: string;
   processIdentity: {
-    connector: VerifiedLinuxConnectorIdentity;
-    child: VerifiedLinuxProcessIdentity;
+    connector: VerifiedConnectorIdentity;
+    child: VerifiedProcessIdentity;
   };
   promptChannel: "stdin" | "pty";
 }
 
+export type VerifiedLinuxProcessRecord = Omit<VerifiedProcessRecord, "processIdentity"> & {
+  processIdentity: {
+    connector: VerifiedLinuxConnectorIdentity;
+    child: VerifiedLinuxProcessIdentity;
+  };
+};
+
 /** Durable process evidence available to startup recovery, never request content. */
 export interface RecoverableDispatchProcessIdentity {
   readonly promptChannel: "stdin" | "pty";
-  readonly connector: VerifiedLinuxConnectorIdentity;
-  readonly child: VerifiedLinuxProcessIdentity;
+  readonly connector: VerifiedConnectorIdentity;
+  readonly child: VerifiedProcessIdentity;
 }
 
 /**
@@ -225,14 +245,10 @@ export interface RecoverableDispatch {
 /** Durable queued-owner evidence for a request that has not dispatched. */
 export interface RecoverableQueuedOwner {
   readonly requestId: string;
-  readonly owner: VerifiedLinuxConnectorIdentity;
+  readonly owner: VerifiedConnectorIdentity;
 }
 
 export type LeaseSuspectReason = "heartbeat_expired" | "identity_unverifiable";
-
-export interface AdmissionRuntimeReaperReaders extends LinuxProcessEvidenceReaders {
-  listProcessIds(): readonly number[];
-}
 
 export interface AdmissionRuntimeReaperSummary {
   readonly inspected: number;
@@ -316,20 +332,9 @@ interface LeaseProcessIdentityRow {
   prompt_channel: "stdin" | "pty";
   connector_owner_instance_id: string;
   connector_created_at: string;
-  connector_boot_id: string;
-  connector_pid: number;
-  connector_start_time_ticks: string;
-  connector_pid_namespace_inode: number;
-  connector_ppid: number;
-  connector_pgrp: number;
-  connector_session: number;
-  child_boot_id: string;
-  child_pid: number;
-  child_start_time_ticks: string;
-  child_pid_namespace_inode: number;
-  child_ppid: number;
-  child_pgrp: number;
-  child_session: number;
+  connector_evidence_json: unknown;
+  child_evidence_json: unknown;
+  recorded_at: number;
 }
 
 interface PolicyStateRow {
@@ -340,6 +345,9 @@ interface PolicyStateRow {
   capacity_cooldown_ms: unknown;
   drain_state: unknown;
   policy_fingerprint: unknown;
+  updated_at: unknown;
+  updated_by_owner_instance_id: unknown;
+  process_evidence_platform: unknown;
 }
 
 interface QueuedOwnerRequestRow {
@@ -350,13 +358,8 @@ interface QueuedOwnerRequestRow {
 interface QueuedOwnerIdentityRow {
   owner_instance_id: string;
   created_at: string;
-  boot_id: string;
-  pid: number;
-  start_time_ticks: string;
-  pid_namespace_inode: number;
-  ppid: number;
-  pgrp: number;
-  session: number;
+  queued_owner_evidence_json: unknown;
+  recorded_at: number;
 }
 
 interface RecoverableQueuedOwnerRow extends QueuedOwnerIdentityRow {
@@ -385,25 +388,109 @@ interface RecoverableDispatchRow {
   identity_prompt_channel: unknown;
   identity_connector_owner_instance_id: unknown;
   identity_connector_created_at: unknown;
-  identity_connector_boot_id: unknown;
-  identity_connector_pid: unknown;
-  identity_connector_start_time_ticks: unknown;
-  identity_connector_pid_namespace_inode: unknown;
-  identity_connector_ppid: unknown;
-  identity_connector_pgrp: unknown;
-  identity_connector_session: unknown;
-  identity_child_boot_id: unknown;
-  identity_child_pid: unknown;
-  identity_child_start_time_ticks: unknown;
-  identity_child_pid_namespace_inode: unknown;
-  identity_child_ppid: unknown;
-  identity_child_pgrp: unknown;
-  identity_child_session: unknown;
+  identity_connector_evidence_json: unknown;
+  identity_child_evidence_json: unknown;
 }
 
 type AtomicDispatchIntentOutcome =
   | { status: "committed"; idempotent: boolean }
   | { status: "not_committed"; reason: DispatchIntentFailureReason };
+
+interface V3LeaseProcessIdentityRow {
+  lease_id: unknown;
+  request_id: unknown;
+  lease_generation: unknown;
+  owner_instance_id: unknown;
+  prompt_channel: unknown;
+  connector_owner_instance_id: unknown;
+  connector_created_at: unknown;
+  connector_boot_id: unknown;
+  connector_pid: unknown;
+  connector_start_time_ticks: unknown;
+  connector_pid_namespace_inode: unknown;
+  connector_ppid: unknown;
+  connector_pgrp: unknown;
+  connector_session: unknown;
+  child_boot_id: unknown;
+  child_pid: unknown;
+  child_start_time_ticks: unknown;
+  child_pid_namespace_inode: unknown;
+  child_ppid: unknown;
+  child_pgrp: unknown;
+  child_session: unknown;
+  recorded_at: unknown;
+}
+
+interface V3QueuedOwnerIdentityRow {
+  owner_instance_id: unknown;
+  created_at: unknown;
+  boot_id: unknown;
+  pid: unknown;
+  start_time_ticks: unknown;
+  pid_namespace_inode: unknown;
+  ppid: unknown;
+  pgrp: unknown;
+  session: unknown;
+  recorded_at: unknown;
+}
+
+interface V3ColumnInfoRow {
+  name: unknown;
+  type: unknown;
+  notnull: unknown;
+  pk: unknown;
+}
+
+const V3_MIGRATION_COLUMNS: Readonly<Record<string, readonly (readonly [string, string, number, number])[]>> = {
+  lease_process_identities: [
+    ["lease_id", "TEXT", 0, 1],
+    ["request_id", "TEXT", 1, 0],
+    ["lease_generation", "INTEGER", 1, 0],
+    ["owner_instance_id", "TEXT", 1, 0],
+    ["prompt_channel", "TEXT", 1, 0],
+    ["connector_owner_instance_id", "TEXT", 1, 0],
+    ["connector_created_at", "TEXT", 1, 0],
+    ["connector_boot_id", "TEXT", 1, 0],
+    ["connector_pid", "INTEGER", 1, 0],
+    ["connector_start_time_ticks", "TEXT", 1, 0],
+    ["connector_pid_namespace_inode", "INTEGER", 1, 0],
+    ["connector_ppid", "INTEGER", 1, 0],
+    ["connector_pgrp", "INTEGER", 1, 0],
+    ["connector_session", "INTEGER", 1, 0],
+    ["child_boot_id", "TEXT", 1, 0],
+    ["child_pid", "INTEGER", 1, 0],
+    ["child_start_time_ticks", "TEXT", 1, 0],
+    ["child_pid_namespace_inode", "INTEGER", 1, 0],
+    ["child_ppid", "INTEGER", 1, 0],
+    ["child_pgrp", "INTEGER", 1, 0],
+    ["child_session", "INTEGER", 1, 0],
+    ["recorded_at", "INTEGER", 1, 0]
+  ],
+  policy_state: [
+    ["id", "INTEGER", 0, 1],
+    ["max_active_turns", "INTEGER", 1, 0],
+    ["max_concurrent_starts", "INTEGER", 1, 0],
+    ["min_start_interval_ms", "INTEGER", 1, 0],
+    ["queue_timeout_ms", "INTEGER", 1, 0],
+    ["capacity_cooldown_ms", "INTEGER", 1, 0],
+    ["drain_state", "TEXT", 1, 0],
+    ["policy_fingerprint", "TEXT", 1, 0],
+    ["updated_at", "INTEGER", 1, 0],
+    ["updated_by_owner_instance_id", "TEXT", 1, 0]
+  ],
+  queued_owner_instances: [
+    ["owner_instance_id", "TEXT", 0, 1],
+    ["created_at", "TEXT", 1, 0],
+    ["boot_id", "TEXT", 1, 0],
+    ["pid", "INTEGER", 1, 0],
+    ["start_time_ticks", "TEXT", 1, 0],
+    ["pid_namespace_inode", "INTEGER", 1, 0],
+    ["ppid", "INTEGER", 1, 0],
+    ["pgrp", "INTEGER", 1, 0],
+    ["session", "INTEGER", 1, 0],
+    ["recorded_at", "INTEGER", 1, 0]
+  ]
+};
 
 export class AdmissionConflictError extends Error {
   constructor(_requestId: string) {
@@ -473,7 +560,8 @@ export class AdmissionController {
   readonly #encryptionKey?: Buffer;
   readonly #contentFingerprintKey?: Buffer;
   readonly #faultInjection?: AdmissionControllerFaultInjection;
-  readonly #queuedOwnerIdentity: VerifiedLinuxConnectorIdentity;
+  readonly #processEvidence: ProcessEvidence<PlatformProcessIdentity>;
+  readonly #queuedOwnerIdentity: VerifiedConnectorIdentity;
 
   constructor(options: AdmissionControllerOptions) {
     this.databasePath = options.databasePath;
@@ -481,13 +569,30 @@ export class AdmissionController {
     this.#encryptionKey = validatePurposeKey(options.encryptionKey, "encryption");
     this.#contentFingerprintKey = validatePurposeKey(options.contentFingerprintKey, "content fingerprint");
     this.#faultInjection = validateFaultInjection(options.faultInjection);
-    this.#queuedOwnerIdentity = captureControllerQueuedOwnerIdentity();
+    this.#processEvidence = requireProcessEvidence<PlatformProcessIdentity>(
+      options.processEvidence ?? createLinuxProcessEvidence()
+    );
+    this.#queuedOwnerIdentity = captureControllerQueuedOwnerIdentity(this.#processEvidence);
     this.#db = new Database(options.databasePath);
-    this.#db.pragma("foreign_keys = ON");
-    this.#db.pragma("journal_mode = WAL");
-    this.#db.pragma("synchronous = FULL");
-    this.#db.pragma("busy_timeout = 5000");
-    this.migrate();
+    try {
+      this.#db.pragma("foreign_keys = ON");
+      this.#db.pragma("journal_mode = WAL");
+      this.#db.pragma("synchronous = FULL");
+      this.#db.pragma("busy_timeout = 5000");
+      this.migrate();
+      this.assertDurableStatePlatform();
+    } catch (error) {
+      try {
+        this.#db.close();
+      } catch {
+        this.#encryptionKey?.fill(0);
+        this.#contentFingerprintKey?.fill(0);
+        throw error;
+      }
+      this.#encryptionKey?.fill(0);
+      this.#contentFingerprintKey?.fill(0);
+      throw error;
+    }
   }
 
   close(): void {
@@ -505,6 +610,39 @@ export class AdmissionController {
       .prepare("SELECT MAX(version) AS version FROM schema_migrations")
       .get() as { version: number | null };
     return row.version ?? 0;
+  }
+
+  get processEvidence(): ProcessEvidence {
+    return requireLinuxProcessEvidence(this.#processEvidence);
+  }
+
+  private assertDurableStatePlatform(): void {
+    const platform = this.#processEvidence.platform;
+    const policy = this.readPolicyStateInTransaction();
+    if (policy !== undefined && policy.process_evidence_platform !== platform) {
+      throw new AdmissionRuntimeError("process evidence platform does not match durable admission platform");
+    }
+
+    const dispatchRows = this.#db
+      .prepare("SELECT connector_evidence_json, child_evidence_json FROM lease_process_identities")
+      .all() as Array<{ connector_evidence_json: unknown; child_evidence_json: unknown }>;
+    for (const row of dispatchRows) {
+      if (
+        parsePlatformProcessIdentity(row.connector_evidence_json, platform) === null ||
+        parsePlatformProcessIdentity(row.child_evidence_json, platform) === null
+      ) {
+        throw new AdmissionRuntimeError("durable process evidence is invalid for the selected platform");
+      }
+    }
+
+    const ownerRows = this.#db
+      .prepare("SELECT queued_owner_evidence_json FROM queued_owner_instances")
+      .all() as Array<{ queued_owner_evidence_json: unknown }>;
+    for (const row of ownerRows) {
+      if (parsePlatformProcessIdentity(row.queued_owner_evidence_json, platform) === null) {
+        throw new AdmissionRuntimeError("durable queued-owner evidence is invalid for the selected platform");
+      }
+    }
   }
 
   enqueue(input: EnqueueRequest): { requestId: string; existed: boolean } {
@@ -681,7 +819,7 @@ export class AdmissionController {
   }
 
   /**
-   * Persist a verified Linux process record and dispatch_intent in one SQLite
+   * Persist a verified process record and dispatch_intent in one SQLite
    * transaction. The following dispatch-boundary commit callback is an exact replay
    * check, so no crash window exists between those two callbacks.
    */
@@ -875,9 +1013,12 @@ export class AdmissionController {
    * Runtime recovery is evidence-only: a stale heartbeat can mark suspicion,
    * but only connector/child/process-group proof can release local capacity.
    */
-  reapSuspects(now: number, readers: AdmissionRuntimeReaperReaders): AdmissionRuntimeReaperSummary {
+  reapSuspects(now: number, processEvidence: ProcessEvidence): AdmissionRuntimeReaperSummary {
     validateTimestamp(now, "runtime reaper timestamp");
-    const processIds = readRuntimeProcessIds(readers);
+    const evidence = requireProcessEvidence(processEvidence);
+    if (evidence.platform !== this.#processEvidence.platform) {
+      throw new AdmissionRuntimeError("process evidence platform does not match durable admission platform");
+    }
     let released = 0;
     let retained = 0;
     let markedRecoveryRequired = 0;
@@ -885,7 +1026,7 @@ export class AdmissionController {
     let queuedSettled = 0;
 
     for (const queuedOwner of this.listRecoverableQueuedOwners()) {
-      const owner = observeLinuxProcessIdentity(queuedOwner.owner, readers);
+      const owner = evidence.observe(queuedOwner.owner);
       if (isGoneIdentity(owner)) {
         if (this.settleQueuedOwnerDeath(queuedOwner.requestId, queuedOwner.owner.ownerInstanceId, now)) {
           queuedSettled += 1;
@@ -895,18 +1036,23 @@ export class AdmissionController {
 
     const dispatches = this.listRecoverableDispatches();
     for (const dispatch of dispatches) {
-      if (isHeartbeatStale(dispatch.heartbeatAt, now) || dispatch.processIdentity === null || processIds === null) {
-        if (this.markSuspect(dispatch.fence, now, suspectReason(dispatch, processIds))) suspected += 1;
-      }
-
-      if (dispatch.processIdentity === null || processIds === null) {
+      if (dispatch.processIdentity === null) {
+        if (this.markSuspect(dispatch.fence, now, "identity_unverifiable")) suspected += 1;
         retained += 1;
         continue;
       }
 
-      const connector = observeLinuxProcessIdentity(dispatch.processIdentity.connector, readers);
-      const child = observeLinuxProcessIdentity(dispatch.processIdentity.child, readers);
-      const residue = inspectLinuxProcessGroup(dispatch.processIdentity.child, processIds, readers);
+      const connector = evidence.observe(dispatch.processIdentity.connector);
+      const child = evidence.observe(dispatch.processIdentity.child);
+      const residue = evidence.inspectProcessGroup(dispatch.processIdentity.child);
+      const unverifiable =
+        connector === "unverifiable" || child === "unverifiable" || residue === "unverifiable";
+
+      if (unverifiable || isHeartbeatStale(dispatch.heartbeatAt, now)) {
+        const reason = unverifiable ? "identity_unverifiable" : "heartbeat_expired";
+        if (this.markSuspect(dispatch.fence, now, reason)) suspected += 1;
+      }
+
       if (isGoneIdentity(connector) && isGoneIdentity(child) && residue === "empty") {
         try {
           this.releaseExitedRecoverySeat(dispatch.fence, now);
@@ -918,8 +1064,7 @@ export class AdmissionController {
         }
       }
 
-      if (connector === "unverifiable" || child === "unverifiable" || residue === "unverifiable") {
-        if (this.markSuspect(dispatch.fence, now, "identity_unverifiable")) suspected += 1;
+      if (unverifiable) {
         retained += 1;
         continue;
       }
@@ -1015,20 +1160,8 @@ export class AdmissionController {
                 identity.prompt_channel AS identity_prompt_channel,
                 identity.connector_owner_instance_id AS identity_connector_owner_instance_id,
                 identity.connector_created_at AS identity_connector_created_at,
-                identity.connector_boot_id AS identity_connector_boot_id,
-                identity.connector_pid AS identity_connector_pid,
-                identity.connector_start_time_ticks AS identity_connector_start_time_ticks,
-                identity.connector_pid_namespace_inode AS identity_connector_pid_namespace_inode,
-                identity.connector_ppid AS identity_connector_ppid,
-                identity.connector_pgrp AS identity_connector_pgrp,
-                identity.connector_session AS identity_connector_session,
-                identity.child_boot_id AS identity_child_boot_id,
-                identity.child_pid AS identity_child_pid,
-                identity.child_start_time_ticks AS identity_child_start_time_ticks,
-                identity.child_pid_namespace_inode AS identity_child_pid_namespace_inode,
-                identity.child_ppid AS identity_child_ppid,
-                identity.child_pgrp AS identity_child_pgrp,
-                identity.child_session AS identity_child_session
+                identity.connector_evidence_json AS identity_connector_evidence_json,
+                identity.child_evidence_json AS identity_child_evidence_json
          FROM leases AS lease
          LEFT JOIN turn_requests AS request ON request.request_id = lease.request_id
          LEFT JOIN lease_process_identities AS identity ON identity.lease_id = lease.lease_id
@@ -1037,7 +1170,7 @@ export class AdmissionController {
       .all() as RecoverableDispatchRow[];
     const inventory: RecoverableDispatch[] = [];
     for (const row of rows) {
-      const dispatch = toRecoverableDispatch(row);
+      const dispatch = toRecoverableDispatch(row, this.#processEvidence.platform);
       if (dispatch !== null) inventory.push(dispatch);
     }
     return Object.freeze(inventory);
@@ -1053,13 +1186,7 @@ export class AdmissionController {
         `SELECT request.request_id AS request_id,
                 owner.owner_instance_id AS owner_instance_id,
                 owner.created_at AS created_at,
-                owner.boot_id AS boot_id,
-                owner.pid AS pid,
-                owner.start_time_ticks AS start_time_ticks,
-                owner.pid_namespace_inode AS pid_namespace_inode,
-                owner.ppid AS ppid,
-                owner.pgrp AS pgrp,
-                owner.session AS session,
+                owner.queued_owner_evidence_json AS queued_owner_evidence_json,
                 owner.recorded_at AS recorded_at
          FROM turn_requests AS request
          JOIN queued_owner_instances AS owner
@@ -1070,7 +1197,7 @@ export class AdmissionController {
       )
       .all() as RecoverableQueuedOwnerRow[];
     const owners: RecoverableQueuedOwner[] = [];
-    for (const row of rows) owners.push(toRecoverableQueuedOwner(row));
+    for (const row of rows) owners.push(toRecoverableQueuedOwner(row, this.#processEvidence.platform));
     return Object.freeze(owners);
   }
 
@@ -1118,6 +1245,7 @@ export class AdmissionController {
     validateIdentifier(ownerInstanceId, "durable policy owner instance ID");
     validateTimestamp(now, "durable policy claim timestamp");
     const policyFingerprint = this.policyFingerprint(normalizedPolicy);
+    const platform = this.#processEvidence.platform;
 
     this.transaction(() => {
       const result = this.#db
@@ -1125,9 +1253,9 @@ export class AdmissionController {
           `INSERT INTO policy_state (
              id, max_active_turns, max_concurrent_starts, min_start_interval_ms,
              queue_timeout_ms, capacity_cooldown_ms, drain_state, policy_fingerprint,
-             updated_at, updated_by_owner_instance_id
+             updated_at, updated_by_owner_instance_id, process_evidence_platform
            )
-           SELECT 1, ?, ?, ?, ?, ?, 'steady', ?, ?, ?
+           SELECT 1, ?, ?, ?, ?, ?, 'steady', ?, ?, ?, ?
            WHERE NOT EXISTS (SELECT 1 FROM policy_state WHERE id = 1)`
         )
         .run(
@@ -1138,10 +1266,11 @@ export class AdmissionController {
           normalizedPolicy.capacityCooldownMs,
           policyFingerprint,
           now,
-          ownerInstanceId
+          ownerInstanceId,
+          platform
         );
       if (result.changes === 1) return;
-      this.assertDurablePolicyMatchInTransaction(normalizedPolicy, policyFingerprint);
+      this.assertDurablePolicyMatchInTransaction(normalizedPolicy, policyFingerprint, platform);
     });
   }
 
@@ -1150,7 +1279,11 @@ export class AdmissionController {
     validateIdentifier(ownerInstanceId, "durable policy owner instance ID");
     validateTimestamp(now, "durable policy assertion timestamp");
     const policyFingerprint = this.policyFingerprint(normalizedPolicy);
-    this.transaction(() => this.assertDurablePolicyMatchInTransaction(normalizedPolicy, policyFingerprint));
+    this.transaction(() => this.assertDurablePolicyMatchInTransaction(
+      normalizedPolicy,
+      policyFingerprint,
+      this.#processEvidence.platform
+    ));
   }
 
   beginSoftDrainTo1(ownerInstanceId: string, now: number): void {
@@ -1195,9 +1328,17 @@ export class AdmissionController {
         if (applied > ADMISSION_SCHEMA_VERSION) {
           throw new AdmissionMigrationError(`schema version ${applied} is newer than this connector supports`);
         }
+        const ledgerExists = this.#db
+          .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
+          .get() !== undefined;
         if (applied === 0) {
-          this.createInitialV1Schema(Date.now());
-          applied = 1;
+          if (ledgerExists) {
+            throw new AdmissionMigrationError("admission migration ledger is empty or partial");
+          }
+          this.createInitialV4Schema(Date.now());
+          applied = 4;
+        } else {
+          assertMigrationSequence(this.#db, applied);
         }
         if (applied === 1) {
           this.migrateV1ToV2(Date.now());
@@ -1207,16 +1348,19 @@ export class AdmissionController {
           this.migrateV2ToV3(Date.now());
           applied = 3;
         }
+        if (applied === 3) {
+          this.migrateV3ToV4(Date.now());
+          applied = 4;
+        }
         if (applied !== ADMISSION_SCHEMA_VERSION) {
           throw new AdmissionMigrationError(`schema version ${applied} is not supported`);
         }
+        assertAdmissionSchemaIntegrity(this.#db);
       });
     } catch (error) {
       if (error instanceof AdmissionMigrationError) throw error;
-      throw new AdmissionMigrationError("v2 DDL transaction rolled back");
+      throw new AdmissionMigrationError("v4 DDL transaction rolled back");
     }
-
-    assertAdmissionSchemaIntegrity(this.#db);
   }
 
   private assertRenameColumnAvailable(): void {
@@ -1224,6 +1368,139 @@ export class AdmissionController {
     if (compareSqliteVersions(row.version, "3.25.0") < 0) {
       throw new AdmissionMigrationError(`SQLite ${row.version} does not support ALTER TABLE RENAME COLUMN`);
     }
+  }
+
+  private createInitialV4Schema(appliedAt: number): void {
+    const existing = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS count FROM sqlite_master
+         WHERE type = 'table' AND name IN (
+           'schema_migrations', 'turn_requests', 'leases', 'cooldowns', 'turn_payloads',
+           'lease_process_identities', 'start_history', 'sessions', 'events',
+           'policy_state', 'queued_owner_instances'
+         )`
+      )
+      .get() as { count: number };
+    if (existing.count > 0) {
+      throw new AdmissionMigrationError("unversioned admission tables require an explicit migration before use");
+    }
+    this.#db.exec(`
+      CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at INTEGER NOT NULL
+      );
+      CREATE TABLE turn_requests (
+        request_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        state TEXT NOT NULL,
+        enqueued_at INTEGER NOT NULL,
+        deadline_at INTEGER NOT NULL,
+        lease_generation INTEGER NOT NULL DEFAULT 0,
+        terminal_at INTEGER,
+        queued_owner_instance_id TEXT,
+        queued_owner_recorded_at INTEGER
+      );
+      CREATE TABLE leases (
+        lease_id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE REFERENCES turn_requests(request_id),
+        generation INTEGER NOT NULL,
+        owner_instance_id TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        acquired_at INTEGER NOT NULL,
+        heartbeat_at INTEGER NOT NULL,
+        suspect_since INTEGER,
+        suspect_reason TEXT CHECK (suspect_reason IS NULL OR suspect_reason IN ('heartbeat_expired', 'identity_unverifiable'))
+      );
+      CREATE TABLE cooldowns (
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        not_before INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (provider, model)
+      );
+      CREATE TABLE turn_payloads (
+        request_id TEXT PRIMARY KEY REFERENCES turn_requests(request_id) ON DELETE CASCADE,
+        nonce BLOB NOT NULL,
+        ciphertext BLOB NOT NULL,
+        auth_tag BLOB NOT NULL,
+        key_version INTEGER NOT NULL,
+        content_fingerprint TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE TABLE lease_process_identities (
+        lease_id TEXT PRIMARY KEY REFERENCES leases(lease_id) ON DELETE CASCADE,
+        request_id TEXT NOT NULL REFERENCES turn_requests(request_id),
+        lease_generation INTEGER NOT NULL,
+        owner_instance_id TEXT NOT NULL,
+        prompt_channel TEXT NOT NULL,
+        connector_owner_instance_id TEXT NOT NULL,
+        connector_created_at TEXT NOT NULL,
+        connector_evidence_json TEXT NOT NULL CHECK (json_valid(connector_evidence_json)),
+        child_evidence_json TEXT NOT NULL CHECK (json_valid(child_evidence_json)),
+        recorded_at INTEGER NOT NULL
+      );
+      CREATE TABLE start_history (
+        lease_id TEXT PRIMARY KEY,
+        started_at INTEGER NOT NULL
+      );
+      CREATE TABLE policy_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        max_active_turns INTEGER NOT NULL CHECK (max_active_turns >= 1),
+        max_concurrent_starts INTEGER NOT NULL CHECK (max_concurrent_starts >= 1),
+        min_start_interval_ms INTEGER NOT NULL CHECK (min_start_interval_ms >= 2000),
+        queue_timeout_ms INTEGER NOT NULL CHECK (queue_timeout_ms > 0 AND queue_timeout_ms <= 1800000),
+        capacity_cooldown_ms INTEGER NOT NULL CHECK (capacity_cooldown_ms >= 30000),
+        drain_state TEXT NOT NULL CHECK (drain_state IN ('steady', 'soft_draining_to_1')),
+        policy_fingerprint TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        updated_by_owner_instance_id TEXT NOT NULL,
+        process_evidence_platform TEXT NOT NULL CHECK (process_evidence_platform IN ('linux', 'darwin'))
+      );
+      CREATE TABLE queued_owner_instances (
+        owner_instance_id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        queued_owner_evidence_json TEXT NOT NULL CHECK (json_valid(queued_owner_evidence_json)),
+        recorded_at INTEGER NOT NULL
+      );
+      CREATE TABLE sessions (
+        session_id TEXT NOT NULL PRIMARY KEY,
+        conversation_id TEXT,
+        conversation_cursor INTEGER NOT NULL,
+        model TEXT NOT NULL,
+        effort TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        cwd TEXT NOT NULL,
+        roots_json TEXT NOT NULL,
+        v2_user_message_ids_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE events (
+        event_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind TEXT NOT NULL,
+        from_state TEXT NOT NULL,
+        to_state TEXT NOT NULL,
+        occurred_at INTEGER NOT NULL,
+        correlation_hmac TEXT NOT NULL
+      );
+      CREATE INDEX turn_requests_queue ON turn_requests(state, enqueued_at);
+      CREATE INDEX turn_requests_queued_owner ON turn_requests(queued_owner_instance_id)
+        WHERE queued_owner_instance_id IS NOT NULL;
+      CREATE INDEX leases_phase ON leases(phase);
+      CREATE UNIQUE INDEX lease_process_identities_request ON lease_process_identities(request_id);
+      CREATE INDEX start_history_started ON start_history(started_at);
+      CREATE INDEX sessions_updated_at_session_id ON sessions(updated_at DESC, session_id ASC);
+      CREATE INDEX sessions_cwd_updated_at_session_id ON sessions(cwd, updated_at DESC, session_id ASC);
+      CREATE INDEX events_occurred ON events(occurred_at, event_seq);
+    `);
+    this.#db
+      .prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (4, 'shared-admission-queue-v4', ?)")
+      .run(appliedAt);
   }
 
   private createInitialV1Schema(appliedAt: number): void {
@@ -1409,6 +1686,186 @@ export class AdmissionController {
       .run(appliedAt);
   }
 
+  private migrateV3ToV4(appliedAt: number): void {
+    assertV3MigrationShape(this.#db);
+    if (this.#processEvidence.platform !== "linux") {
+      throw new AdmissionMigrationError("schema v3 evidence can only be migrated with a linux process evidence adapter");
+    }
+
+    const leaseRows = this.#db
+      .prepare(
+        `SELECT lease_id, request_id, lease_generation, owner_instance_id, prompt_channel,
+                connector_owner_instance_id, connector_created_at, connector_boot_id, connector_pid,
+                connector_start_time_ticks, connector_pid_namespace_inode, connector_ppid,
+                connector_pgrp, connector_session, child_boot_id, child_pid, child_start_time_ticks,
+                child_pid_namespace_inode, child_ppid, child_pgrp, child_session, recorded_at
+         FROM lease_process_identities`
+      )
+      .all() as V3LeaseProcessIdentityRow[];
+    const ownerRows = this.#db
+      .prepare(
+        `SELECT owner_instance_id, created_at, boot_id, pid, start_time_ticks, pid_namespace_inode,
+                ppid, pgrp, session, recorded_at
+         FROM queued_owner_instances`
+      )
+      .all() as V3QueuedOwnerIdentityRow[];
+
+    const migratedLeaseRows = leaseRows.map((row) => {
+      const leaseId = normalizeIdentifier(row.lease_id, "v3 lease process identity lease ID");
+      const requestId = normalizeIdentifier(row.request_id, "v3 lease process identity request ID");
+      const ownerInstanceId = normalizeOwnerInstanceId(row.owner_instance_id);
+      const connector = normalizeVerifiedConnectorIdentity({
+        ownerInstanceId: row.connector_owner_instance_id,
+        createdAt: row.connector_created_at,
+        bootId: row.connector_boot_id,
+        pid: row.connector_pid,
+        startTimeTicks: row.connector_start_time_ticks,
+        pidNamespaceInode: row.connector_pid_namespace_inode,
+        ppid: row.connector_ppid,
+        pgrp: row.connector_pgrp,
+        session: row.connector_session
+      });
+      if (connector.ownerInstanceId !== ownerInstanceId) {
+        throw new Error("v3 lease process identity owner mismatch");
+      }
+      if (row.prompt_channel !== "stdin" && row.prompt_channel !== "pty") {
+        throw new Error("v3 lease process identity prompt channel is invalid");
+      }
+      const child = normalizeVerifiedProcessIdentity({
+        bootId: row.child_boot_id,
+        pid: row.child_pid,
+        startTimeTicks: row.child_start_time_ticks,
+        pidNamespaceInode: row.child_pid_namespace_inode,
+        ppid: row.child_ppid,
+        pgrp: row.child_pgrp,
+        session: row.child_session
+      });
+      validateTimestamp(row.recorded_at, "v3 lease process identity recorded timestamp");
+      return {
+        leaseId,
+        requestId,
+        generation: normalizePositiveSafeInteger(row.lease_generation, "v3 lease process identity generation", Number.MAX_SAFE_INTEGER),
+        ownerInstanceId,
+        promptChannel: row.prompt_channel,
+        connector,
+        child,
+        recordedAt: row.recorded_at
+      };
+    });
+
+    const migratedOwnerRows = ownerRows.map((row) => {
+      const owner = normalizeVerifiedConnectorIdentity({
+        ownerInstanceId: row.owner_instance_id,
+        createdAt: row.created_at,
+        bootId: row.boot_id,
+        pid: row.pid,
+        startTimeTicks: row.start_time_ticks,
+        pidNamespaceInode: row.pid_namespace_inode,
+        ppid: row.ppid,
+        pgrp: row.pgrp,
+        session: row.session
+      });
+      validateTimestamp(row.recorded_at, "v3 queued owner recorded timestamp");
+      return { owner, recordedAt: row.recorded_at };
+    });
+
+    this.#db.exec(`
+      CREATE TABLE lease_process_identities_v4 (
+        lease_id TEXT PRIMARY KEY REFERENCES leases(lease_id) ON DELETE CASCADE,
+        request_id TEXT NOT NULL REFERENCES turn_requests(request_id),
+        lease_generation INTEGER NOT NULL,
+        owner_instance_id TEXT NOT NULL,
+        prompt_channel TEXT NOT NULL,
+        connector_owner_instance_id TEXT NOT NULL,
+        connector_created_at TEXT NOT NULL,
+        connector_evidence_json TEXT NOT NULL CHECK (json_valid(connector_evidence_json)),
+        child_evidence_json TEXT NOT NULL CHECK (json_valid(child_evidence_json)),
+        recorded_at INTEGER NOT NULL
+      );
+      CREATE TABLE queued_owner_instances_v4 (
+        owner_instance_id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        queued_owner_evidence_json TEXT NOT NULL CHECK (json_valid(queued_owner_evidence_json)),
+        recorded_at INTEGER NOT NULL
+      );
+      CREATE TABLE policy_state_v4 (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        max_active_turns INTEGER NOT NULL CHECK (max_active_turns >= 1),
+        max_concurrent_starts INTEGER NOT NULL CHECK (max_concurrent_starts >= 1),
+        min_start_interval_ms INTEGER NOT NULL CHECK (min_start_interval_ms >= 2000),
+        queue_timeout_ms INTEGER NOT NULL CHECK (queue_timeout_ms > 0 AND queue_timeout_ms <= 1800000),
+        capacity_cooldown_ms INTEGER NOT NULL CHECK (capacity_cooldown_ms >= 30000),
+        drain_state TEXT NOT NULL CHECK (drain_state IN ('steady', 'soft_draining_to_1')),
+        policy_fingerprint TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        updated_by_owner_instance_id TEXT NOT NULL,
+        process_evidence_platform TEXT NOT NULL CHECK (process_evidence_platform IN ('linux', 'darwin'))
+      );
+    `);
+
+    const insertLease = this.#db.prepare(
+      `INSERT INTO lease_process_identities_v4 (
+         lease_id, request_id, lease_generation, owner_instance_id, prompt_channel,
+         connector_owner_instance_id, connector_created_at, connector_evidence_json,
+         child_evidence_json, recorded_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    );
+    for (const row of migratedLeaseRows) {
+      insertLease.run(
+        row.leaseId,
+        row.requestId,
+        row.generation,
+        row.ownerInstanceId,
+        row.promptChannel,
+        row.connector.ownerInstanceId,
+        row.connector.createdAt,
+        serializeProcessIdentity(row.connector, "linux"),
+        serializeProcessIdentity(row.child, "linux"),
+        row.recordedAt
+      );
+    }
+
+    const insertOwner = this.#db.prepare(
+      `INSERT INTO queued_owner_instances_v4 (
+         owner_instance_id, created_at, queued_owner_evidence_json, recorded_at
+       ) VALUES (?, ?, ?, ?)`
+    );
+    for (const row of migratedOwnerRows) {
+      insertOwner.run(
+        row.owner.ownerInstanceId,
+        row.owner.createdAt,
+        serializeProcessIdentity(row.owner, "linux"),
+        row.recordedAt
+      );
+    }
+
+    this.#db
+      .prepare(
+        `INSERT INTO policy_state_v4 (
+           id, max_active_turns, max_concurrent_starts, min_start_interval_ms,
+           queue_timeout_ms, capacity_cooldown_ms, drain_state, policy_fingerprint,
+           updated_at, updated_by_owner_instance_id, process_evidence_platform
+         )
+         SELECT id, max_active_turns, max_concurrent_starts, min_start_interval_ms,
+                queue_timeout_ms, capacity_cooldown_ms, drain_state, policy_fingerprint,
+                updated_at, updated_by_owner_instance_id, 'linux'
+         FROM policy_state`
+      )
+      .run();
+    this.#db.exec(`
+      DROP TABLE lease_process_identities;
+      DROP TABLE queued_owner_instances;
+      DROP TABLE policy_state;
+      ALTER TABLE lease_process_identities_v4 RENAME TO lease_process_identities;
+      ALTER TABLE queued_owner_instances_v4 RENAME TO queued_owner_instances;
+      ALTER TABLE policy_state_v4 RENAME TO policy_state;
+      CREATE UNIQUE INDEX lease_process_identities_request ON lease_process_identities(request_id);
+    `);
+    this.#db
+      .prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (4, 'shared-admission-queue-v4', ?)")
+      .run(appliedAt);
+  }
+
   private transaction<T>(fn: () => T): T {
     return this.#db.transaction(fn)();
   }
@@ -1423,7 +1880,7 @@ export class AdmissionController {
   }
 
   private persistProcessIdentityAndDispatchIntent(input: unknown): AtomicDispatchIntentOutcome {
-    const record = normalizeVerifiedLinuxProcessRecord(input);
+    const record = normalizeVerifiedProcessRecord(input, this.#processEvidence.platform);
     if (record === null) return { status: "not_committed", reason: "invalid_process_identity" };
 
     try {
@@ -1441,7 +1898,7 @@ export class AdmissionController {
 
   /** A failed writer may inspect only a committed, exact winner; it never retries a write. */
   private recheckDispatchIdentityAfterContention(
-    record: VerifiedLinuxProcessRecord
+    record: VerifiedProcessRecord
   ): AtomicDispatchIntentOutcome | null {
     for (let attempt = 0; attempt < MAX_DISPATCH_CONTENTION_RECHECKS; attempt += 1) {
       try {
@@ -1459,7 +1916,7 @@ export class AdmissionController {
 
   /** Reads the lease and identity under one snapshot so no partial winner can be inferred. */
   private inspectDispatchIdentityContentionWinner(
-    record: VerifiedLinuxProcessRecord
+    record: VerifiedProcessRecord
   ): AtomicDispatchIntentOutcome | "pending" | null {
     const lease = this.#db
       .prepare(
@@ -1490,7 +1947,7 @@ export class AdmissionController {
       ) {
         return null;
       }
-      return sameLeaseProcessIdentity(identity, record)
+      return sameLeaseProcessIdentity(identity, record, this.#processEvidence.platform)
         ? { status: "committed", idempotent: true }
         : { status: "not_committed", reason: "conflicting_intent" };
     }
@@ -1500,7 +1957,7 @@ export class AdmissionController {
   }
 
   private persistProcessIdentityAndDispatchIntentInTransaction(
-    record: VerifiedLinuxProcessRecord
+    record: VerifiedProcessRecord
   ): AtomicDispatchIntentOutcome {
     const lease = this.#db
       .prepare(
@@ -1518,7 +1975,7 @@ export class AdmissionController {
 
     const existing = this.findLeaseProcessIdentity(record.leaseId);
     if (lease.phase === "dispatch_intent") {
-      return existing !== undefined && sameLeaseProcessIdentity(existing, record)
+      return existing !== undefined && sameLeaseProcessIdentity(existing, record, this.#processEvidence.platform)
         ? { status: "committed", idempotent: true }
         : { status: "not_committed", reason: "conflicting_intent" };
     }
@@ -1562,27 +2019,23 @@ export class AdmissionController {
     return this.#db
       .prepare(
         `SELECT lease_id, request_id, lease_generation, owner_instance_id, prompt_channel,
-                connector_owner_instance_id, connector_created_at, connector_boot_id, connector_pid,
-                connector_start_time_ticks, connector_pid_namespace_inode, connector_ppid, connector_pgrp,
-                connector_session, child_boot_id, child_pid, child_start_time_ticks, child_pid_namespace_inode,
-                child_ppid, child_pgrp, child_session
+                connector_owner_instance_id, connector_created_at, connector_evidence_json,
+                child_evidence_json, recorded_at
          FROM lease_process_identities
          WHERE lease_id = ?`
       )
       .get(leaseId) as LeaseProcessIdentityRow | undefined;
   }
 
-  private insertLeaseProcessIdentity(record: VerifiedLinuxProcessRecord, recordedAt: number): void {
+  private insertLeaseProcessIdentity(record: VerifiedProcessRecord, recordedAt: number): void {
     const { connector, child } = record.processIdentity;
     this.#db
       .prepare(
         `INSERT INTO lease_process_identities (
            lease_id, request_id, lease_generation, owner_instance_id, prompt_channel,
-           connector_owner_instance_id, connector_created_at, connector_boot_id, connector_pid,
-           connector_start_time_ticks, connector_pid_namespace_inode, connector_ppid, connector_pgrp,
-           connector_session, child_boot_id, child_pid, child_start_time_ticks, child_pid_namespace_inode,
-           child_ppid, child_pgrp, child_session, recorded_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           connector_owner_instance_id, connector_created_at, connector_evidence_json,
+           child_evidence_json, recorded_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         record.leaseId,
@@ -1592,30 +2045,21 @@ export class AdmissionController {
         record.promptChannel,
         connector.ownerInstanceId,
         connector.createdAt,
-        connector.bootId,
-        connector.pid,
-        connector.startTimeTicks,
-        connector.pidNamespaceInode,
-        connector.ppid,
-        connector.pgrp,
-        connector.session,
-        child.bootId,
-        child.pid,
-        child.startTimeTicks,
-        child.pidNamespaceInode,
-        child.ppid,
-        child.pgrp,
-        child.session,
+        serializeVerifiedConnectorProcessIdentity(connector, this.#processEvidence.platform),
+        serializePlatformProcessIdentity(child, this.#processEvidence.platform),
         recordedAt
       );
   }
 
   private persistQueuedOwnerReference(input: EnqueueRequest, recordedAt: number, requestExisted: boolean): void {
-    const owner = normalizeVerifiedLinuxConnectorIdentity(input.ownerIdentity ?? this.#queuedOwnerIdentity);
+    const owner = normalizeVerifiedConnectorIdentity(
+      input.ownerIdentity ?? this.#queuedOwnerIdentity,
+      this.#processEvidence.platform
+    );
     const existingOwner = this.findQueuedOwnerIdentity(owner.ownerInstanceId);
     if (existingOwner === undefined) {
       this.insertQueuedOwnerIdentity(owner, recordedAt);
-    } else if (!sameQueuedOwnerIdentity(existingOwner, owner)) {
+    } else if (!sameQueuedOwnerIdentity(existingOwner, owner, this.#processEvidence.platform)) {
       throw new AdmissionConflictError(input.requestId);
     }
 
@@ -1649,32 +2093,24 @@ export class AdmissionController {
   private findQueuedOwnerIdentity(ownerInstanceId: string): QueuedOwnerIdentityRow | undefined {
     return this.#db
       .prepare(
-        `SELECT owner_instance_id, created_at, boot_id, pid, start_time_ticks,
-                pid_namespace_inode, ppid, pgrp, session
+        `SELECT owner_instance_id, created_at, queued_owner_evidence_json, recorded_at
          FROM queued_owner_instances
          WHERE owner_instance_id = ?`
       )
       .get(ownerInstanceId) as QueuedOwnerIdentityRow | undefined;
   }
 
-  private insertQueuedOwnerIdentity(owner: VerifiedLinuxConnectorIdentity, recordedAt: number): void {
+  private insertQueuedOwnerIdentity(owner: VerifiedConnectorIdentity, recordedAt: number): void {
     this.#db
       .prepare(
         `INSERT INTO queued_owner_instances (
-           owner_instance_id, created_at, boot_id, pid, start_time_ticks,
-           pid_namespace_inode, ppid, pgrp, session, recorded_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+           owner_instance_id, created_at, queued_owner_evidence_json, recorded_at
+         ) VALUES (?, ?, ?, ?)`
       )
       .run(
         owner.ownerInstanceId,
         owner.createdAt,
-        owner.bootId,
-        owner.pid,
-        owner.startTimeTicks,
-        owner.pidNamespaceInode,
-        owner.ppid,
-        owner.pgrp,
-        owner.session,
+        serializeVerifiedConnectorProcessIdentity(owner, this.#processEvidence.platform),
         recordedAt
       );
   }
@@ -2028,12 +2464,19 @@ export class AdmissionController {
       .digest("hex");
   }
 
-  private assertDurablePolicyMatchInTransaction(policy: AdmissionPolicy, policyFingerprint: string): void {
+  private assertDurablePolicyMatchInTransaction(
+    policy: AdmissionPolicy,
+    policyFingerprint: string,
+    platform: ProcessEvidencePlatform
+  ): void {
     const row = this.readPolicyStateInTransaction();
     if (row === undefined) {
       throw new AdmissionRuntimeError("durable policy has not been claimed");
     }
-    if (!policyStateMatches(row, policy, policyFingerprint)) {
+    if (row.process_evidence_platform !== platform) {
+      throw new AdmissionRuntimeError("process evidence platform does not match durable admission platform");
+    }
+    if (!policyStateMatches(row, policy, policyFingerprint, platform)) {
       throw new AdmissionRuntimeError("durable policy does not match shared runtime policy");
     }
   }
@@ -2042,7 +2485,8 @@ export class AdmissionController {
     return this.#db
       .prepare(
         `SELECT max_active_turns, max_concurrent_starts, min_start_interval_ms,
-                queue_timeout_ms, capacity_cooldown_ms, drain_state, policy_fingerprint
+                queue_timeout_ms, capacity_cooldown_ms, drain_state, policy_fingerprint,
+                updated_at, updated_by_owner_instance_id, process_evidence_platform
          FROM policy_state WHERE id = 1`
       )
       .get() as PolicyStateRow | undefined;
@@ -2225,14 +2669,20 @@ function normalizedPolicyTuple(policy: AdmissionPolicy): readonly [number, numbe
   ]);
 }
 
-function policyStateMatches(row: PolicyStateRow, policy: AdmissionPolicy, policyFingerprint: string): boolean {
+function policyStateMatches(
+  row: PolicyStateRow,
+  policy: AdmissionPolicy,
+  policyFingerprint: string,
+  platform: ProcessEvidencePlatform
+): boolean {
   return (
     row.max_active_turns === policy.maxActiveTurns &&
     row.max_concurrent_starts === policy.maxConcurrentStarts &&
     row.min_start_interval_ms === policy.minStartIntervalMs &&
     row.queue_timeout_ms === policy.queueTimeoutMs &&
     row.capacity_cooldown_ms === policy.capacityCooldownMs &&
-    row.policy_fingerprint === policyFingerprint
+    row.policy_fingerprint === policyFingerprint &&
+    row.process_evidence_platform === platform
   );
 }
 
@@ -2327,6 +2777,150 @@ function validateFaultInjection(value: unknown): AdmissionControllerFaultInjecti
   }
 }
 
+function assertV3MigrationShape(db: Database.Database): void {
+  for (const [table, expectedColumns] of Object.entries(V3_MIGRATION_COLUMNS)) {
+    const actual = db.pragma(`table_info('${table}')`) as V3ColumnInfoRow[];
+    if (
+      !Array.isArray(actual) ||
+      actual.length !== expectedColumns.length ||
+      actual.some((column, index) => {
+        const expected = expectedColumns[index];
+        return (
+          expected === undefined ||
+          column.name !== expected[0] ||
+          column.type !== expected[1] ||
+          column.notnull !== expected[2] ||
+          column.pk !== expected[3]
+        );
+      })
+    ) {
+      throw new AdmissionMigrationError(`schema v3 table ${table} does not match the migration contract`);
+    }
+  }
+
+  const requiredSql = new Map<string, readonly string[]>([
+    ["lease_process_identities", [
+      "lease_id TEXT PRIMARY KEY REFERENCES leases(lease_id) ON DELETE CASCADE",
+      "request_id TEXT NOT NULL REFERENCES turn_requests(request_id)"
+    ]],
+    ["policy_state", [
+      "id INTEGER PRIMARY KEY CHECK (id = 1)",
+      "max_active_turns INTEGER NOT NULL CHECK (max_active_turns >= 1)",
+      "max_concurrent_starts INTEGER NOT NULL CHECK (max_concurrent_starts >= 1)",
+      "min_start_interval_ms INTEGER NOT NULL CHECK (min_start_interval_ms >= 2000)",
+      "queue_timeout_ms INTEGER NOT NULL CHECK (queue_timeout_ms > 0 AND queue_timeout_ms <= 1800000)",
+      "capacity_cooldown_ms INTEGER NOT NULL CHECK (capacity_cooldown_ms >= 30000)",
+      "drain_state TEXT NOT NULL CHECK (drain_state IN ('steady', 'soft_draining_to_1'))"
+    ]],
+    ["queued_owner_instances", []]
+  ]);
+  for (const [table, fragments] of requiredSql) {
+    const row = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(table) as { sql?: unknown } | undefined;
+    if (typeof row?.sql !== "string") {
+      throw new AdmissionMigrationError(`schema v3 table ${table} definition is unavailable`);
+    }
+    const normalized = row.sql.replace(/\s+/g, " ").trim().toUpperCase();
+    for (const fragment of fragments) {
+      if (!normalized.includes(fragment.replace(/\s+/g, " ").trim().toUpperCase())) {
+        throw new AdmissionMigrationError(`schema v3 table ${table} definition does not match the migration contract`);
+      }
+    }
+  }
+
+  const namedIndexes = (db.pragma("index_list('lease_process_identities')") as Array<{
+    name: unknown;
+    origin: unknown;
+    unique: unknown;
+    partial: unknown;
+  }>).filter((index) => index.origin === "c");
+  if (
+    namedIndexes.length !== 1 ||
+    namedIndexes[0]?.name !== "lease_process_identities_request" ||
+    namedIndexes[0]?.unique !== 1 ||
+    namedIndexes[0]?.partial !== 0
+  ) {
+    throw new AdmissionMigrationError("schema v3 lease process identity indexes do not match the migration contract");
+  }
+  const indexColumns = (db.pragma("index_xinfo('lease_process_identities_request')") as Array<{
+    seqno: unknown;
+    name: unknown;
+    key: unknown;
+    coll: unknown;
+  }>)
+    .filter((column) => column.key === 1)
+    .sort((left, right) => Number(left.seqno) - Number(right.seqno));
+  if (
+    indexColumns.length !== 1 ||
+    indexColumns[0]?.name !== "request_id" ||
+    indexColumns[0]?.coll !== "BINARY"
+  ) {
+    throw new AdmissionMigrationError("schema v3 lease process identity index columns do not match the migration contract");
+  }
+  for (const table of ["policy_state", "queued_owner_instances"]) {
+    const indexes = db.pragma(`index_list('${table}')`) as Array<{ origin: unknown }>;
+    if (indexes.some((index) => index.origin === "c")) {
+      throw new AdmissionMigrationError(`schema v3 table ${table} has an unexpected named index`);
+    }
+  }
+
+  const foreignKeys = (db.pragma("foreign_key_list('lease_process_identities')") as Array<{
+    from: string;
+    table: string;
+    to: string;
+    on_update: string;
+    on_delete: string;
+    match: string;
+  }>).map((foreignKey) => JSON.stringify([
+    foreignKey.from,
+    foreignKey.table,
+    foreignKey.to,
+    foreignKey.on_update,
+    foreignKey.on_delete,
+    foreignKey.match
+  ])).sort();
+  const expectedForeignKeys = [
+    JSON.stringify(["lease_id", "leases", "lease_id", "NO ACTION", "CASCADE", "NONE"]),
+    JSON.stringify(["request_id", "turn_requests", "request_id", "NO ACTION", "NO ACTION", "NONE"])
+  ].sort();
+  if (JSON.stringify(foreignKeys) !== JSON.stringify(expectedForeignKeys)) {
+    throw new AdmissionMigrationError("schema v3 lease process identity foreign keys do not match the migration contract");
+  }
+  for (const table of ["policy_state", "queued_owner_instances"]) {
+    const unexpectedForeignKeys = db.pragma(`foreign_key_list('${table}')`);
+    if (Array.isArray(unexpectedForeignKeys) && unexpectedForeignKeys.length > 0) {
+      throw new AdmissionMigrationError(`schema v3 table ${table} has unexpected foreign keys`);
+    }
+  }
+}
+
+function assertMigrationSequence(db: Database.Database, applied: number): void {
+  const rows = db
+    .prepare("SELECT version, name FROM schema_migrations ORDER BY version ASC")
+    .all() as Array<{ version: unknown; name: unknown }>;
+  const versions = rows.map((row) => row.version);
+  if (versions.some((version) => typeof version !== "number" || !Number.isSafeInteger(version))) {
+    throw new AdmissionMigrationError("admission migration ledger contains a non-integer version");
+  }
+  const numericVersions = versions as number[];
+  const complete = numericVersions.length === 4 && numericVersions.every((version, index) => version === index + 1);
+  const fresh = numericVersions.length === 1 && numericVersions[0] === 4;
+  const legacy = !complete && !fresh && numericVersions.length === applied && numericVersions.every(
+    (version, index) => version === index + 1
+  );
+  if (!complete && !fresh && !legacy) {
+    throw new AdmissionMigrationError("admission migration ledger is partial or unknown");
+  }
+  for (const row of rows) {
+    const version = row.version as number;
+    const name = ADMISSION_MIGRATION_NAMES[version - 1];
+    if (name === undefined || row.name !== name) {
+      throw new AdmissionMigrationError(`admission migration ${version} has an invalid name`);
+    }
+  }
+}
+
 function compareSqliteVersions(left: string, right: string): number {
   const leftParts = sqliteVersionParts(left);
   const rightParts = sqliteVersionParts(right);
@@ -2358,7 +2952,10 @@ function isSqliteTransactionContention(error: unknown): boolean {
   );
 }
 
-function normalizeVerifiedLinuxProcessRecord(value: unknown): VerifiedLinuxProcessRecord | null {
+function normalizeVerifiedProcessRecord(
+  value: unknown,
+  platform: ProcessEvidencePlatform = "linux"
+): VerifiedProcessRecord | null {
   try {
     const record = dataRecord(value, ["requestId", "leaseId", "generation", "ownerInstanceId", "processIdentity", "promptChannel"]);
     if (record === null) return null;
@@ -2366,8 +2963,8 @@ function normalizeVerifiedLinuxProcessRecord(value: unknown): VerifiedLinuxProce
     if (processIdentity === null) return null;
 
     const ownerInstanceId = normalizeOwnerInstanceId(record.ownerInstanceId);
-    const connector = normalizeVerifiedLinuxConnectorIdentity(processIdentity.connector);
-    const child = normalizeVerifiedLinuxProcessIdentity(processIdentity.child);
+    const connector = normalizeVerifiedConnectorIdentity(processIdentity.connector, platform);
+    const child = normalizeVerifiedProcessIdentity(processIdentity.child, platform);
     if (connector.ownerInstanceId !== ownerInstanceId) return null;
     const promptChannel = record.promptChannel;
     if (promptChannel !== "stdin" && promptChannel !== "pty") return null;
@@ -2385,53 +2982,75 @@ function normalizeVerifiedLinuxProcessRecord(value: unknown): VerifiedLinuxProce
   }
 }
 
-function captureControllerQueuedOwnerIdentity(): VerifiedLinuxConnectorIdentity {
-  return normalizeVerifiedLinuxConnectorIdentity({
-    ownerInstanceId: randomUUID(),
-    createdAt: new Date().toISOString(),
-    ...captureLinuxProcessIdentity(process.pid, nativeLinuxProcessEvidenceReaders)
-  });
+function requireLinuxProcessEvidence(
+  processEvidence: ProcessEvidence<PlatformProcessIdentity>
+): ProcessEvidence<ProcessIdentity> {
+  if (processEvidence.platform !== "linux") {
+    throw new AdmissionRuntimeError("platform process evidence is not available through the Linux compatibility accessor");
+  }
+  return processEvidence as unknown as ProcessEvidence<ProcessIdentity>;
 }
 
-function normalizeVerifiedLinuxConnectorIdentity(value: unknown): VerifiedLinuxConnectorIdentity {
-  const record = dataRecord(value, [
-    "ownerInstanceId",
-    "createdAt",
-    "bootId",
-    "pid",
-    "startTimeTicks",
-    "pidNamespaceInode",
-    "ppid",
-    "pgrp",
-    "session"
-  ]);
+function captureControllerQueuedOwnerIdentity(
+  processEvidence: ProcessEvidence<PlatformProcessIdentity>
+): VerifiedConnectorIdentity {
+  return normalizeVerifiedConnectorIdentity({
+    ownerInstanceId: randomUUID(),
+    createdAt: new Date().toISOString(),
+    ...processEvidence.capture(process.pid)
+  }, processEvidence.platform);
+}
+
+function normalizeVerifiedConnectorIdentity(
+  value: unknown,
+  platform: ProcessEvidencePlatform = "linux"
+): VerifiedConnectorIdentity {
+  const identityKeys = PLATFORM_PROCESS_IDENTITY_KEYS[platform];
+  const record = dataRecord(value, ["ownerInstanceId", "createdAt", ...identityKeys]);
   if (record === null) throw new Error("connector identity is invalid");
+  const identity = normalizeVerifiedProcessIdentity(copyPlatformProcessIdentityFields(record, platform), platform);
   return Object.freeze({
     ownerInstanceId: normalizeOwnerInstanceId(record.ownerInstanceId),
     createdAt: normalizeCanonicalUtcTimestamp(record.createdAt),
-    ...normalizeVerifiedLinuxProcessIdentityFields(record)
+    ...identity
   });
 }
 
-function normalizeVerifiedLinuxProcessIdentity(value: unknown): VerifiedLinuxProcessIdentity {
-  const record = dataRecord(value, ["bootId", "pid", "startTimeTicks", "pidNamespaceInode", "ppid", "pgrp", "session"]);
+function serializeVerifiedConnectorProcessIdentity(
+  value: VerifiedConnectorIdentity,
+  platform: ProcessEvidencePlatform
+): string {
+  const identityKeys = PLATFORM_PROCESS_IDENTITY_KEYS[platform];
+  const record = dataRecord(value, ["ownerInstanceId", "createdAt", ...identityKeys]);
+  if (record === null) throw new Error("connector identity is invalid");
+  return serializePlatformProcessIdentity(copyPlatformProcessIdentityFields(record, platform), platform);
+}
+
+function copyPlatformProcessIdentityFields(
+  record: Record<string, unknown>,
+  platform: ProcessEvidencePlatform
+): Record<string, unknown> {
+  const identityRecord: Record<string, unknown> = Object.create(null);
+  for (const key of PLATFORM_PROCESS_IDENTITY_KEYS[platform]) identityRecord[key] = record[key];
+  return identityRecord;
+}
+
+function normalizeVerifiedProcessIdentity(
+  value: unknown,
+  platform: ProcessEvidencePlatform = "linux"
+): VerifiedProcessIdentity {
+  const record = dataRecord(value, PLATFORM_PROCESS_IDENTITY_KEYS[platform]);
   if (record === null) throw new Error("process identity is invalid");
-  return normalizeVerifiedLinuxProcessIdentityFields(record);
+  const identity = normalizePlatformProcessIdentity(record, platform);
+  if (identity === null) throw new Error("process identity is invalid");
+  return identity;
 }
 
-function normalizeVerifiedLinuxProcessIdentityFields(record: Record<string, unknown>): VerifiedLinuxProcessIdentity {
-  return Object.freeze({
-    bootId: normalizeBootId(record.bootId),
-    pid: normalizePositiveSafeInteger(record.pid, "process PID", 2_147_483_647),
-    startTimeTicks: normalizeStartTimeTicks(record.startTimeTicks),
-    pidNamespaceInode: normalizePositiveSafeInteger(record.pidNamespaceInode, "PID namespace inode", 4_294_967_295),
-    ppid: normalizePositiveSafeInteger(record.ppid, "process parent PID", 2_147_483_647),
-    pgrp: normalizePositiveSafeInteger(record.pgrp, "process group", 2_147_483_647),
-    session: normalizePositiveSafeInteger(record.session, "process session", 2_147_483_647)
-  });
-}
-
-function sameLeaseProcessIdentity(row: LeaseProcessIdentityRow, record: VerifiedLinuxProcessRecord): boolean {
+function sameLeaseProcessIdentity(
+  row: LeaseProcessIdentityRow,
+  record: VerifiedProcessRecord,
+  platform: ProcessEvidencePlatform
+): boolean {
   const { connector, child } = record.processIdentity;
   return (
     row.request_id === record.requestId &&
@@ -2440,34 +3059,20 @@ function sameLeaseProcessIdentity(row: LeaseProcessIdentityRow, record: Verified
     row.prompt_channel === record.promptChannel &&
     row.connector_owner_instance_id === connector.ownerInstanceId &&
     row.connector_created_at === connector.createdAt &&
-    row.connector_boot_id === connector.bootId &&
-    row.connector_pid === connector.pid &&
-    row.connector_start_time_ticks === connector.startTimeTicks &&
-    row.connector_pid_namespace_inode === connector.pidNamespaceInode &&
-    row.connector_ppid === connector.ppid &&
-    row.connector_pgrp === connector.pgrp &&
-    row.connector_session === connector.session &&
-    row.child_boot_id === child.bootId &&
-    row.child_pid === child.pid &&
-    row.child_start_time_ticks === child.startTimeTicks &&
-    row.child_pid_namespace_inode === child.pidNamespaceInode &&
-    row.child_ppid === child.ppid &&
-    row.child_pgrp === child.pgrp &&
-    row.child_session === child.session
+    row.connector_evidence_json === serializeVerifiedConnectorProcessIdentity(connector, platform) &&
+    row.child_evidence_json === serializePlatformProcessIdentity(child, platform)
   );
 }
 
-function sameQueuedOwnerIdentity(row: QueuedOwnerIdentityRow, owner: VerifiedLinuxConnectorIdentity): boolean {
+function sameQueuedOwnerIdentity(
+  row: QueuedOwnerIdentityRow,
+  owner: VerifiedConnectorIdentity,
+  platform: ProcessEvidencePlatform
+): boolean {
   return (
     row.owner_instance_id === owner.ownerInstanceId &&
     row.created_at === owner.createdAt &&
-    row.boot_id === owner.bootId &&
-    row.pid === owner.pid &&
-    row.start_time_ticks === owner.startTimeTicks &&
-    row.pid_namespace_inode === owner.pidNamespaceInode &&
-    row.ppid === owner.ppid &&
-    row.pgrp === owner.pgrp &&
-    row.session === owner.session
+    row.queued_owner_evidence_json === serializeVerifiedConnectorProcessIdentity(owner, platform)
   );
 }
 
@@ -2518,60 +3123,11 @@ function normalizeCanonicalUtcTimestamp(value: unknown): string {
   return value;
 }
 
-function normalizeBootId(value: unknown): string {
-  if (
-    typeof value !== "string" ||
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value) ||
-    /^0{8}-0{4}-0{4}-0{4}-0{12}$/.test(value)
-  ) {
-    throw new Error("process boot ID is invalid");
-  }
-  return value;
-}
-
-function normalizeStartTimeTicks(value: unknown): string {
-  if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value) || BigInt(value) > 18_446_744_073_709_551_615n) {
-    throw new Error("process start time is invalid");
-  }
-  return value;
-}
-
 function normalizePositiveSafeInteger(value: unknown, label: string, maximum: number): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > maximum) {
     throw new Error(`${label} must be a positive safe integer`);
   }
   return value;
-}
-
-function readRuntimeProcessIds(readers: AdmissionRuntimeReaperReaders): readonly number[] | null {
-  if (
-    typeof readers !== "object" ||
-    readers === null ||
-    typeof readers.listProcessIds !== "function"
-  ) {
-    return null;
-  }
-
-  let value: unknown;
-  try {
-    value = readers.listProcessIds();
-  } catch {
-    return null;
-  }
-  if (!Array.isArray(value)) return null;
-  const ids: number[] = [];
-  for (const pid of value) {
-    if (!Number.isSafeInteger(pid) || pid < 1 || pid > MAX_RUNTIME_PID) return null;
-    ids.push(pid);
-  }
-  return Object.freeze([...new Set(ids)].sort((left, right) => left - right));
-}
-
-function suspectReason(
-  dispatch: RecoverableDispatch,
-  processIds: readonly number[] | null
-): LeaseSuspectReason {
-  return dispatch.processIdentity === null || processIds === null ? "identity_unverifiable" : "heartbeat_expired";
 }
 
 function validateSuspectReason(reason: LeaseSuspectReason): void {
@@ -2584,36 +3140,41 @@ function isHeartbeatStale(heartbeatAt: number, now: number): boolean {
   return now - heartbeatAt > LEASE_HEARTBEAT_STALE_MS;
 }
 
-function isGoneIdentity(value: LinuxProcessIdentityState): boolean {
+function isGoneIdentity(value: ProcessIdentityState): boolean {
   return value === "gone" || value === "pid_reused";
 }
 
-function toRecoverableQueuedOwner(row: RecoverableQueuedOwnerRow): RecoverableQueuedOwner {
+function toRecoverableQueuedOwner(
+  row: RecoverableQueuedOwnerRow,
+  platform: ProcessEvidencePlatform
+): RecoverableQueuedOwner {
   try {
     return Object.freeze({
       requestId: normalizeIdentifier(row.request_id, "recoverable queued-owner request ID"),
-      owner: normalizeQueuedOwnerIdentityRow(row)
+      owner: normalizeQueuedOwnerIdentityRow(row, platform)
     });
   } catch {
     throw new RecoverableDispatchInventoryError();
   }
 }
 
-function normalizeQueuedOwnerIdentityRow(row: QueuedOwnerIdentityRow): VerifiedLinuxConnectorIdentity {
-  return normalizeVerifiedLinuxConnectorIdentity({
+function normalizeQueuedOwnerIdentityRow(
+  row: QueuedOwnerIdentityRow,
+  platform: ProcessEvidencePlatform
+): VerifiedConnectorIdentity {
+  const identity = parsePlatformProcessIdentity(row.queued_owner_evidence_json, platform);
+  if (identity === null) throw new Error("queued owner process evidence is invalid");
+  return normalizeVerifiedConnectorIdentity({
     ownerInstanceId: row.owner_instance_id,
     createdAt: row.created_at,
-    bootId: row.boot_id,
-    pid: row.pid,
-    startTimeTicks: row.start_time_ticks,
-    pidNamespaceInode: row.pid_namespace_inode,
-    ppid: row.ppid,
-    pgrp: row.pgrp,
-    session: row.session
-  });
+    ...identity
+  }, platform);
 }
 
-function toRecoverableDispatch(row: RecoverableDispatchRow): RecoverableDispatch | null {
+function toRecoverableDispatch(
+  row: RecoverableDispatchRow,
+  platform: ProcessEvidencePlatform
+): RecoverableDispatch | null {
   try {
     const requestId = normalizeIdentifier(row.request_id, "recoverable dispatch request ID");
     const leaseRequestId = normalizeIdentifier(row.lease_request_id, "recoverable dispatch lease request ID");
@@ -2643,7 +3204,7 @@ function toRecoverableDispatch(row: RecoverableDispatchRow): RecoverableDispatch
       throw new Error("lease/request fence mismatch");
     }
 
-    const processIdentity = toRecoverableDispatchProcessIdentity(row, requestId, fence);
+    const processIdentity = toRecoverableDispatchProcessIdentity(row, requestId, fence, platform);
     if (processIdentity !== null && (phase === "admitted" || phase === "starting")) {
       throw new Error("process identity predates dispatch intent");
     }
@@ -2670,7 +3231,8 @@ function toRecoverableDispatch(row: RecoverableDispatchRow): RecoverableDispatch
 function toRecoverableDispatchProcessIdentity(
   row: RecoverableDispatchRow,
   requestId: string,
-  fence: LeaseFence
+  fence: LeaseFence,
+  platform: ProcessEvidencePlatform
 ): RecoverableDispatchProcessIdentity | null {
   const values = [
     row.identity_lease_id,
@@ -2680,20 +3242,8 @@ function toRecoverableDispatchProcessIdentity(
     row.identity_prompt_channel,
     row.identity_connector_owner_instance_id,
     row.identity_connector_created_at,
-    row.identity_connector_boot_id,
-    row.identity_connector_pid,
-    row.identity_connector_start_time_ticks,
-    row.identity_connector_pid_namespace_inode,
-    row.identity_connector_ppid,
-    row.identity_connector_pgrp,
-    row.identity_connector_session,
-    row.identity_child_boot_id,
-    row.identity_child_pid,
-    row.identity_child_start_time_ticks,
-    row.identity_child_pid_namespace_inode,
-    row.identity_child_ppid,
-    row.identity_child_pgrp,
-    row.identity_child_session
+    row.identity_connector_evidence_json,
+    row.identity_child_evidence_json
   ];
   if (values.every((value) => value === null)) return null;
   if (values.some((value) => value === null || value === undefined)) {
@@ -2723,30 +3273,20 @@ function toRecoverableDispatchProcessIdentity(
     throw new Error("process identity prompt channel is invalid");
   }
 
-  const connector = normalizeVerifiedLinuxConnectorIdentity({
+  const connectorIdentity = parsePlatformProcessIdentity(row.identity_connector_evidence_json, platform);
+  const childIdentity = parsePlatformProcessIdentity(row.identity_child_evidence_json, platform);
+  if (connectorIdentity === null || childIdentity === null) {
+    throw new Error("process evidence is malformed or belongs to another platform");
+  }
+  const connector = normalizeVerifiedConnectorIdentity({
     ownerInstanceId: row.identity_connector_owner_instance_id,
     createdAt: row.identity_connector_created_at,
-    bootId: row.identity_connector_boot_id,
-    pid: row.identity_connector_pid,
-    startTimeTicks: row.identity_connector_start_time_ticks,
-    pidNamespaceInode: row.identity_connector_pid_namespace_inode,
-    ppid: row.identity_connector_ppid,
-    pgrp: row.identity_connector_pgrp,
-    session: row.identity_connector_session
-  });
+    ...connectorIdentity
+  }, platform);
   if (connector.ownerInstanceId !== fence.ownerInstanceId) {
     throw new Error("connector process identity owner mismatch");
   }
-  const child = normalizeVerifiedLinuxProcessIdentity({
-    bootId: row.identity_child_boot_id,
-    pid: row.identity_child_pid,
-    startTimeTicks: row.identity_child_start_time_ticks,
-    pidNamespaceInode: row.identity_child_pid_namespace_inode,
-    ppid: row.identity_child_ppid,
-    pgrp: row.identity_child_pgrp,
-    session: row.identity_child_session
-  });
-  return Object.freeze({ promptChannel: row.identity_prompt_channel, connector, child });
+  return Object.freeze({ promptChannel: row.identity_prompt_channel, connector, child: childIdentity });
 }
 
 function normalizeRequestState(value: unknown): RequestState {

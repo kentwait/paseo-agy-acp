@@ -35,6 +35,8 @@
   },
   "files": [
     "dist",
+    "prebuilds/darwin-arm64/darwin_process_evidence.node",
+    "prebuilds/darwin-x64/darwin_process_evidence.node",
     "scripts/prepare-admission-state-dir.mjs",
     "scripts/prepare-official-kernel-compat.mjs",
     "assets/official-kernel-compat/rc01/paseo_model_compat.py",
@@ -45,9 +47,14 @@
     "package.json"
   ],
   "scripts": {
-    "build": "node scripts/clean-dist.mjs && tsc",
+    "build": "node scripts/clean-dist.mjs && tsc && npm run build:native",
+    "build:native": "node scripts/build-darwin-process-evidence.mjs",
+    "build:native:prebuild:arm64": "node scripts/build-darwin-prebuild.mjs --arch=arm64",
+    "build:native:prebuild:x64": "node scripts/build-darwin-prebuild.mjs --arch=x64",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "npm run typecheck && npm run build && vitest run",
+    "test:native:source": "npm run build:native && vitest run tests/admission-darwin-process-evidence-native.test.ts",
+    "test:package:installed": "npm run build && vitest run tests/darwin-process-evidence-installed-package.test.ts",
     "validate:architecture": "node scripts/verify-import-boundaries.mjs",
     "validate:secrets": "node scripts/verify-no-secrets.mjs",
     "validate": "npm test && npm run validate:architecture && npm run validate:secrets",
@@ -60,6 +67,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^26.1.1",
+    "node-gyp": "^11.5.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   },

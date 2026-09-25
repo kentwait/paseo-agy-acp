@@ -224,6 +224,21 @@ npm ci
 npm run validate
 ```
 
+在 macOS 上，安装 Xcode Command Line Tools 后，贡献者可以构建并单独测试源码回退：
+
+```bash
+npm run build:native
+npm run test:native:source
+```
+
+源码回退产物写入被忽略的 `build/Release/`；安装包会按主机选择已经审核的
+`prebuilds/darwin-arm64` 或 `prebuilds/darwin-x64` Node-API artifact。维护者可用
+`npm run build:native:prebuild:arm64` 或 `npm run build:native:prebuild:x64`
+重新生成对应 artifact。Apple Silicon 主机可以交叉编译 x64 artifact，但执行其
+native contract 仍需要 Intel Mac 或 x64 Rosetta 环境。安装包测试可从
+`PASEO_AGY_ACP_TEST_NODE_EXECUTABLES` 读取 JSON 路径数组；设置后会要求 Node 22 和
+Node 24 都加载同一个与主机匹配的 prebuild。
+
 官方内核 smoke 还需要 `PASEO_AGY_ACP_OFFICIAL_BIN`：
 
 ```bash

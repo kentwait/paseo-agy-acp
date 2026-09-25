@@ -4,6 +4,7 @@ import path from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { AdmissionController, type AdmissionPolicy } from "../Admission Controller/controller.js";
+import type { ProcessEvidence } from "../Admission Controller/process-evidence.js";
 import {
   ADMISSION_SCHEMA_VERSION,
   SchemaIntegrityError,
@@ -21,6 +22,23 @@ const POLICY: AdmissionPolicy = {
   capacityCooldownMs: 30_000
 };
 
+function processEvidence(): ProcessEvidence {
+  return {
+    platform: "linux",
+    capture: () => ({
+      bootId: "f4bca3da-9bd5-4f2e-89b8-5e12e5ee8f31",
+      pid: process.pid,
+      startTimeTicks: "100",
+      pidNamespaceInode: 4_026_531_836,
+      ppid: 1,
+      pgrp: process.pid,
+      session: process.pid
+    }),
+    observe: () => "same",
+    inspectProcessGroup: () => "empty"
+  };
+}
+
 function createController(): AdmissionController {
   const stateDir = mkdtempSync(path.join(os.tmpdir(), "paseo-agy-schema-contract-"));
   stateDirs.push(stateDir);
@@ -28,7 +46,8 @@ function createController(): AdmissionController {
     databasePath: path.join(stateDir, "runtime.sqlite"),
     policy: POLICY,
     encryptionKey: Buffer.alloc(32, 71),
-    contentFingerprintKey: Buffer.alloc(32, 72)
+    contentFingerprintKey: Buffer.alloc(32, 72),
+    processEvidence: processEvidence()
   });
   controllers.push(admission);
   return admission;
@@ -52,7 +71,7 @@ afterEach(() => {
   for (const stateDir of stateDirs.splice(0)) rmSync(stateDir, { recursive: true, force: true });
 });
 
-describe("Admission schema integrity contract v1", () => {
+describe("Admission schema integrity contract v4", () => {
   it("accepts the legal v1 schema and migration ledger", () => {
     const admission = createController();
     const db = new Database(admission.databasePath, { readonly: true });
