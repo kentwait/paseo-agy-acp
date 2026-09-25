@@ -1,8 +1,6 @@
 import type Database from "better-sqlite3";
-import {
-  isProcessEvidencePlatform,
-  parseProcessIdentityEnvelope
-} from "./process-evidence.js";
+import { parsePlatformProcessIdentityEnvelope } from "./canonical-process-identity.js";
+import { isProcessEvidencePlatform } from "./process-evidence.js";
 
 /** The newest AdmissionController schema this connector can safely use. */
 export const ADMISSION_SCHEMA_VERSION = 4;
@@ -543,8 +541,8 @@ function assertCanonicalEvidence(db: Database.Database): void {
     .prepare("SELECT connector_evidence_json, child_evidence_json FROM lease_process_identities")
     .all() as Array<{ connector_evidence_json: unknown; child_evidence_json: unknown }>;
   for (const row of dispatchRows) {
-    const connector = parseProcessIdentityEnvelope(row.connector_evidence_json);
-    const child = parseProcessIdentityEnvelope(row.child_evidence_json);
+    const connector = parsePlatformProcessIdentityEnvelope(row.connector_evidence_json);
+    const child = parsePlatformProcessIdentityEnvelope(row.child_evidence_json);
     if (connector === null || child === null) fail("lease process evidence is not canonical JSON");
     if (connector.platform !== child.platform) fail("lease process evidence platform does not match its counterpart");
     if (evidencePlatform !== undefined && connector.platform !== evidencePlatform) {
@@ -557,7 +555,7 @@ function assertCanonicalEvidence(db: Database.Database): void {
     .prepare("SELECT queued_owner_evidence_json FROM queued_owner_instances")
     .all() as Array<{ queued_owner_evidence_json: unknown }>;
   for (const row of ownerRows) {
-    const owner = parseProcessIdentityEnvelope(row.queued_owner_evidence_json);
+    const owner = parsePlatformProcessIdentityEnvelope(row.queued_owner_evidence_json);
     if (owner === null) fail("queued-owner process evidence is not canonical JSON");
     if (evidencePlatform !== undefined && owner.platform !== evidencePlatform) {
       fail("queued-owner process evidence platform does not match policy state");

@@ -6,7 +6,6 @@ import {
 } from "./schema.js";
 import {
   createLinuxProcessEvidence,
-  parseProcessIdentity,
   requireProcessEvidence,
   serializeProcessIdentity,
   type ProcessEvidence,
@@ -14,6 +13,13 @@ import {
   type ProcessIdentity,
   type ProcessIdentityState
 } from "./process-evidence.js";
+import {
+  normalizePlatformProcessIdentity,
+  parsePlatformProcessIdentity,
+  PLATFORM_PROCESS_IDENTITY_KEYS,
+  serializePlatformProcessIdentity,
+  type PlatformProcessIdentity
+} from "./canonical-process-identity.js";
 import {
   isAllowedAdmissionActiveTurns,
   isAllowedAdmissionConcurrentStarts
@@ -49,7 +55,7 @@ export interface AdmissionControllerOptions {
   policy: AdmissionPolicy;
   encryptionKey?: Buffer;
   contentFingerprintKey?: Buffer;
-  processEvidence?: ProcessEvidence;
+  processEvidence?: ProcessEvidence<PlatformProcessIdentity>;
   /** Test-only synchronous hook for proving rollback at the atomic dispatch boundary. */
   faultInjection?: AdmissionControllerFaultInjection;
 }
@@ -178,17 +184,20 @@ export type RecoverableDispatchPhase =
   | "recovery_required";
 
 /** Immutable evidence for one process instance. */
-export type VerifiedProcessIdentity = ProcessIdentity;
+export type VerifiedProcessIdentity = PlatformProcessIdentity;
 
-export type VerifiedLinuxProcessIdentity = VerifiedProcessIdentity;
+export type VerifiedLinuxProcessIdentity = ProcessIdentity;
 
 /** Connector owner evidence paired with the connector's stable instance ID. */
-export interface VerifiedConnectorIdentity extends ProcessIdentity {
+export type VerifiedConnectorIdentity = PlatformProcessIdentity & {
   ownerInstanceId: string;
   createdAt: string;
-}
+};
 
-export type VerifiedLinuxConnectorIdentity = VerifiedConnectorIdentity;
+export type VerifiedLinuxConnectorIdentity = ProcessIdentity & {
+  ownerInstanceId: string;
+  createdAt: string;
+};
 
 /** The only process record accepted at the irreversible dispatch boundary. */
 export interface VerifiedProcessRecord {
@@ -203,7 +212,12 @@ export interface VerifiedProcessRecord {
   promptChannel: "stdin" | "pty";
 }
 
-export type VerifiedLinuxProcessRecord = VerifiedProcessRecord;
+export type VerifiedLinuxProcessRecord = Omit<VerifiedProcessRecord, "processIdentity"> & {
+  processIdentity: {
+    connector: VerifiedLinuxConnectorIdentity;
+    child: VerifiedLinuxProcessIdentity;
+  };
+};
 
 /** Durable process evidence available to startup recovery, never request content. */
 export interface RecoverableDispatchProcessIdentity {
@@ -546,7 +560,7 @@ export class AdmissionController {
   readonly #encryptionKey?: Buffer;
   readonly #contentFingerprintKey?: Buffer;
   readonly #faultInjection?: AdmissionControllerFaultInjection;
-  readonly #processEvidence: ProcessEvidence;
+  readonly #processEvidence: ProcessEvidence<PlatformProcessIdentity>;
   readonly #queuedOwnerIdentity: VerifiedConnectorIdentity;
 
   constructor(options: AdmissionControllerOptions) {
@@ -555,7 +569,9 @@ export class AdmissionController {
     this.#encryptionKey = validatePurposeKey(options.encryptionKey, "encryption");
     this.#contentFingerprintKey = validatePurposeKey(options.contentFingerprintKey, "content fingerprint");
     this.#faultInjection = validateFaultInjection(options.faultInjection);
-    this.#processEvidence = requireProcessEvidence(options.processEvidence ?? createLinuxProcessEvidence());
+    this.#processEvidence = requireProcessEvidence<PlatformProcessIdentity>(
+      options.processEvidence ?? createLinuxProcessEvidence()
+    );
     this.#queuedOwnerIdentity = captureControllerQueuedOwnerIdentity(this.#processEvidence);
     this.#db = new Database(options.databasePath);
     try {
@@ -597,7 +613,7 @@ export class AdmissionController {
   }
 
   get processEvidence(): ProcessEvidence {
-    return this.#processEvidence;
+    return requireLinuxProcessEvidence(this.#processEvidence);
   }
 
   private assertDurableStatePlatform(): void {
@@ -612,8 +628,8 @@ export class AdmissionController {
       .all() as Array<{ connector_evidence_json: unknown; child_evidence_json: unknown }>;
     for (const row of dispatchRows) {
       if (
-        parseProcessIdentity(row.connector_evidence_json, platform) === null ||
-        parseProcessIdentity(row.child_evidence_json, platform) === null
+        parsePlatformProcessIdentity(row.connector_evidence_json, platform) === null ||
+        parsePlatformProcessIdentity(row.child_evidence_json, platform) === null
       ) {
         throw new AdmissionRuntimeError("durable process evidence is invalid for the selected platform");
       }
@@ -623,7 +639,7 @@ export class AdmissionController {
       .prepare("SELECT queued_owner_evidence_json FROM queued_owner_instances")
       .all() as Array<{ queued_owner_evidence_json: unknown }>;
     for (const row of ownerRows) {
-      if (parseProcessIdentity(row.queued_owner_evidence_json, platform) === null) {
+      if (parsePlatformProcessIdentity(row.queued_owner_evidence_json, platform) === null) {
         throw new AdmissionRuntimeError("durable queued-owner evidence is invalid for the selected platform");
       }
     }
@@ -1864,7 +1880,7 @@ export class AdmissionController {
   }
 
   private persistProcessIdentityAndDispatchIntent(input: unknown): AtomicDispatchIntentOutcome {
-    const record = normalizeVerifiedProcessRecord(input);
+    const record = normalizeVerifiedProcessRecord(input, this.#processEvidence.platform);
     if (record === null) return { status: "not_committed", reason: "invalid_process_identity" };
 
     try {
@@ -2029,14 +2045,17 @@ export class AdmissionController {
         record.promptChannel,
         connector.ownerInstanceId,
         connector.createdAt,
-        serializeProcessIdentity(connector, this.#processEvidence.platform),
-        serializeProcessIdentity(child, this.#processEvidence.platform),
+        serializeVerifiedConnectorProcessIdentity(connector, this.#processEvidence.platform),
+        serializePlatformProcessIdentity(child, this.#processEvidence.platform),
         recordedAt
       );
   }
 
   private persistQueuedOwnerReference(input: EnqueueRequest, recordedAt: number, requestExisted: boolean): void {
-    const owner = normalizeVerifiedConnectorIdentity(input.ownerIdentity ?? this.#queuedOwnerIdentity);
+    const owner = normalizeVerifiedConnectorIdentity(
+      input.ownerIdentity ?? this.#queuedOwnerIdentity,
+      this.#processEvidence.platform
+    );
     const existingOwner = this.findQueuedOwnerIdentity(owner.ownerInstanceId);
     if (existingOwner === undefined) {
       this.insertQueuedOwnerIdentity(owner, recordedAt);
@@ -2091,7 +2110,7 @@ export class AdmissionController {
       .run(
         owner.ownerInstanceId,
         owner.createdAt,
-        serializeProcessIdentity(owner, this.#processEvidence.platform),
+        serializeVerifiedConnectorProcessIdentity(owner, this.#processEvidence.platform),
         recordedAt
       );
   }
@@ -2933,7 +2952,10 @@ function isSqliteTransactionContention(error: unknown): boolean {
   );
 }
 
-function normalizeVerifiedProcessRecord(value: unknown): VerifiedProcessRecord | null {
+function normalizeVerifiedProcessRecord(
+  value: unknown,
+  platform: ProcessEvidencePlatform = "linux"
+): VerifiedProcessRecord | null {
   try {
     const record = dataRecord(value, ["requestId", "leaseId", "generation", "ownerInstanceId", "processIdentity", "promptChannel"]);
     if (record === null) return null;
@@ -2941,8 +2963,8 @@ function normalizeVerifiedProcessRecord(value: unknown): VerifiedProcessRecord |
     if (processIdentity === null) return null;
 
     const ownerInstanceId = normalizeOwnerInstanceId(record.ownerInstanceId);
-    const connector = normalizeVerifiedConnectorIdentity(processIdentity.connector);
-    const child = normalizeVerifiedProcessIdentity(processIdentity.child);
+    const connector = normalizeVerifiedConnectorIdentity(processIdentity.connector, platform);
+    const child = normalizeVerifiedProcessIdentity(processIdentity.child, platform);
     if (connector.ownerInstanceId !== ownerInstanceId) return null;
     const promptChannel = record.promptChannel;
     if (promptChannel !== "stdin" && promptChannel !== "pty") return null;
@@ -2960,50 +2982,68 @@ function normalizeVerifiedProcessRecord(value: unknown): VerifiedProcessRecord |
   }
 }
 
-function captureControllerQueuedOwnerIdentity(processEvidence: ProcessEvidence): VerifiedConnectorIdentity {
+function requireLinuxProcessEvidence(
+  processEvidence: ProcessEvidence<PlatformProcessIdentity>
+): ProcessEvidence<ProcessIdentity> {
+  if (processEvidence.platform !== "linux") {
+    throw new AdmissionRuntimeError("platform process evidence is not available through the Linux compatibility accessor");
+  }
+  return processEvidence as unknown as ProcessEvidence<ProcessIdentity>;
+}
+
+function captureControllerQueuedOwnerIdentity(
+  processEvidence: ProcessEvidence<PlatformProcessIdentity>
+): VerifiedConnectorIdentity {
   return normalizeVerifiedConnectorIdentity({
     ownerInstanceId: randomUUID(),
     createdAt: new Date().toISOString(),
     ...processEvidence.capture(process.pid)
-  });
+  }, processEvidence.platform);
 }
 
-function normalizeVerifiedConnectorIdentity(value: unknown): VerifiedConnectorIdentity {
-  const record = dataRecord(value, [
-    "ownerInstanceId",
-    "createdAt",
-    "bootId",
-    "pid",
-    "startTimeTicks",
-    "pidNamespaceInode",
-    "ppid",
-    "pgrp",
-    "session"
-  ]);
+function normalizeVerifiedConnectorIdentity(
+  value: unknown,
+  platform: ProcessEvidencePlatform = "linux"
+): VerifiedConnectorIdentity {
+  const identityKeys = PLATFORM_PROCESS_IDENTITY_KEYS[platform];
+  const record = dataRecord(value, ["ownerInstanceId", "createdAt", ...identityKeys]);
   if (record === null) throw new Error("connector identity is invalid");
+  const identity = normalizeVerifiedProcessIdentity(copyPlatformProcessIdentityFields(record, platform), platform);
   return Object.freeze({
     ownerInstanceId: normalizeOwnerInstanceId(record.ownerInstanceId),
     createdAt: normalizeCanonicalUtcTimestamp(record.createdAt),
-    ...normalizeVerifiedProcessIdentityFields(record)
+    ...identity
   });
 }
 
-function normalizeVerifiedProcessIdentity(value: unknown): VerifiedProcessIdentity {
-  const record = dataRecord(value, ["bootId", "pid", "startTimeTicks", "pidNamespaceInode", "ppid", "pgrp", "session"]);
+function serializeVerifiedConnectorProcessIdentity(
+  value: VerifiedConnectorIdentity,
+  platform: ProcessEvidencePlatform
+): string {
+  const identityKeys = PLATFORM_PROCESS_IDENTITY_KEYS[platform];
+  const record = dataRecord(value, ["ownerInstanceId", "createdAt", ...identityKeys]);
+  if (record === null) throw new Error("connector identity is invalid");
+  return serializePlatformProcessIdentity(copyPlatformProcessIdentityFields(record, platform), platform);
+}
+
+function copyPlatformProcessIdentityFields(
+  record: Record<string, unknown>,
+  platform: ProcessEvidencePlatform
+): Record<string, unknown> {
+  const identityRecord: Record<string, unknown> = Object.create(null);
+  for (const key of PLATFORM_PROCESS_IDENTITY_KEYS[platform]) identityRecord[key] = record[key];
+  return identityRecord;
+}
+
+function normalizeVerifiedProcessIdentity(
+  value: unknown,
+  platform: ProcessEvidencePlatform = "linux"
+): VerifiedProcessIdentity {
+  const record = dataRecord(value, PLATFORM_PROCESS_IDENTITY_KEYS[platform]);
   if (record === null) throw new Error("process identity is invalid");
-  return normalizeVerifiedProcessIdentityFields(record);
-}
-
-function normalizeVerifiedProcessIdentityFields(record: Record<string, unknown>): VerifiedProcessIdentity {
-  return Object.freeze({
-    bootId: normalizeBootId(record.bootId),
-    pid: normalizePositiveSafeInteger(record.pid, "process PID", 2_147_483_647),
-    startTimeTicks: normalizeStartTimeTicks(record.startTimeTicks),
-    pidNamespaceInode: normalizePositiveSafeInteger(record.pidNamespaceInode, "PID namespace inode", 4_294_967_295),
-    ppid: normalizePositiveSafeInteger(record.ppid, "process parent PID", 2_147_483_647),
-    pgrp: normalizePositiveSafeInteger(record.pgrp, "process group", 2_147_483_647),
-    session: normalizePositiveSafeInteger(record.session, "process session", 2_147_483_647)
-  });
+  const identity = normalizePlatformProcessIdentity(record, platform);
+  if (identity === null) throw new Error("process identity is invalid");
+  return identity;
 }
 
 function sameLeaseProcessIdentity(
@@ -3019,8 +3059,8 @@ function sameLeaseProcessIdentity(
     row.prompt_channel === record.promptChannel &&
     row.connector_owner_instance_id === connector.ownerInstanceId &&
     row.connector_created_at === connector.createdAt &&
-    row.connector_evidence_json === serializeProcessIdentity(connector, platform) &&
-    row.child_evidence_json === serializeProcessIdentity(child, platform)
+    row.connector_evidence_json === serializeVerifiedConnectorProcessIdentity(connector, platform) &&
+    row.child_evidence_json === serializePlatformProcessIdentity(child, platform)
   );
 }
 
@@ -3032,7 +3072,7 @@ function sameQueuedOwnerIdentity(
   return (
     row.owner_instance_id === owner.ownerInstanceId &&
     row.created_at === owner.createdAt &&
-    row.queued_owner_evidence_json === serializeProcessIdentity(owner, platform)
+    row.queued_owner_evidence_json === serializeVerifiedConnectorProcessIdentity(owner, platform)
   );
 }
 
@@ -3083,24 +3123,6 @@ function normalizeCanonicalUtcTimestamp(value: unknown): string {
   return value;
 }
 
-function normalizeBootId(value: unknown): string {
-  if (
-    typeof value !== "string" ||
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value) ||
-    /^0{8}-0{4}-0{4}-0{4}-0{12}$/.test(value)
-  ) {
-    throw new Error("process boot ID is invalid");
-  }
-  return value;
-}
-
-function normalizeStartTimeTicks(value: unknown): string {
-  if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value) || BigInt(value) > 18_446_744_073_709_551_615n) {
-    throw new Error("process start time is invalid");
-  }
-  return value;
-}
-
 function normalizePositiveSafeInteger(value: unknown, label: string, maximum: number): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > maximum) {
     throw new Error(`${label} must be a positive safe integer`);
@@ -3140,13 +3162,13 @@ function normalizeQueuedOwnerIdentityRow(
   row: QueuedOwnerIdentityRow,
   platform: ProcessEvidencePlatform
 ): VerifiedConnectorIdentity {
-  const identity = parseProcessIdentity(row.queued_owner_evidence_json, platform);
+  const identity = parsePlatformProcessIdentity(row.queued_owner_evidence_json, platform);
   if (identity === null) throw new Error("queued owner process evidence is invalid");
   return normalizeVerifiedConnectorIdentity({
     ownerInstanceId: row.owner_instance_id,
     createdAt: row.created_at,
     ...identity
-  });
+  }, platform);
 }
 
 function toRecoverableDispatch(
@@ -3251,8 +3273,8 @@ function toRecoverableDispatchProcessIdentity(
     throw new Error("process identity prompt channel is invalid");
   }
 
-  const connectorIdentity = parseProcessIdentity(row.identity_connector_evidence_json, platform);
-  const childIdentity = parseProcessIdentity(row.identity_child_evidence_json, platform);
+  const connectorIdentity = parsePlatformProcessIdentity(row.identity_connector_evidence_json, platform);
+  const childIdentity = parsePlatformProcessIdentity(row.identity_child_evidence_json, platform);
   if (connectorIdentity === null || childIdentity === null) {
     throw new Error("process evidence is malformed or belongs to another platform");
   }
@@ -3260,7 +3282,7 @@ function toRecoverableDispatchProcessIdentity(
     ownerInstanceId: row.identity_connector_owner_instance_id,
     createdAt: row.identity_connector_created_at,
     ...connectorIdentity
-  });
+  }, platform);
   if (connector.ownerInstanceId !== fence.ownerInstanceId) {
     throw new Error("connector process identity owner mismatch");
   }
