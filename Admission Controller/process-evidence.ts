@@ -88,7 +88,7 @@ export interface LinuxPreDispatchTerminationProof extends LinuxPreDispatchProofP
   readonly proofHmac: string;
 }
 
-export type ProcessEvidencePlatform = "linux";
+export type ProcessEvidencePlatform = "linux" | "darwin";
 
 /** A conservative observation of a persisted process identity. */
 export type ProcessIdentityState = "same" | "gone" | "pid_reused" | "unverifiable";
@@ -97,9 +97,9 @@ export type ProcessGroupState = "empty" | "present" | "unverifiable";
 export type LinuxProcessIdentityState = ProcessIdentityState;
 export type LinuxProcessGroupState = ProcessGroupState;
 
-export interface ProcessEvidence {
+export interface ProcessEvidence<TProcessIdentity = ProcessIdentity> {
   readonly platform: ProcessEvidencePlatform;
-  capture(pid: number): ProcessIdentity;
+  capture(pid: number): TProcessIdentity;
   observe(expected: unknown): ProcessIdentityState;
   inspectProcessGroup(expected: unknown): ProcessGroupState;
 }
@@ -153,17 +153,19 @@ export function createLinuxProcessEvidence(options: LinuxProcessEvidenceOptions 
   });
 }
 
-export function requireProcessEvidence(value: unknown): ProcessEvidence {
+export function requireProcessEvidence<TProcessIdentity = ProcessIdentity>(value: unknown): ProcessEvidence<TProcessIdentity> {
   if (
     typeof value !== "object" ||
     value === null ||
-    typeof (value as ProcessEvidence).capture !== "function" ||
-    typeof (value as ProcessEvidence).observe !== "function" ||
-    typeof (value as ProcessEvidence).inspectProcessGroup !== "function"
+    ((value as ProcessEvidence<TProcessIdentity>).platform !== "linux" &&
+      (value as ProcessEvidence<TProcessIdentity>).platform !== "darwin") ||
+    typeof (value as ProcessEvidence<TProcessIdentity>).capture !== "function" ||
+    typeof (value as ProcessEvidence<TProcessIdentity>).observe !== "function" ||
+    typeof (value as ProcessEvidence<TProcessIdentity>).inspectProcessGroup !== "function"
   ) {
     throw new ProcessEvidenceError("process evidence adapter is invalid");
   }
-  return value as ProcessEvidence;
+  return value as ProcessEvidence<TProcessIdentity>;
 }
 
 function nativeLinuxProcessIds(): readonly number[] {
