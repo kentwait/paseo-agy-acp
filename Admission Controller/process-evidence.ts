@@ -105,9 +105,9 @@ export type ProcessGroupState = "empty" | "present" | "unverifiable";
 export type LinuxProcessIdentityState = ProcessIdentityState;
 export type LinuxProcessGroupState = ProcessGroupState;
 
-export interface ProcessEvidence {
+export interface ProcessEvidence<TProcessIdentity = ProcessIdentity> {
   readonly platform: ProcessEvidencePlatform;
-  capture(pid: number): ProcessIdentity;
+  capture(pid: number): TProcessIdentity;
   observe(expected: unknown): ProcessIdentityState;
   inspectProcessGroup(expected: unknown): ProcessGroupState;
 }
@@ -247,18 +247,18 @@ export function isProcessEvidencePlatform(value: unknown): value is ProcessEvide
   return value === "linux" || value === "darwin";
 }
 
-export function requireProcessEvidence(value: unknown): ProcessEvidence {
+export function requireProcessEvidence<TProcessIdentity = ProcessIdentity>(value: unknown): ProcessEvidence<TProcessIdentity> {
   if (
     typeof value !== "object" ||
     value === null ||
-    !isProcessEvidencePlatform((value as ProcessEvidence).platform) ||
-    typeof (value as ProcessEvidence).capture !== "function" ||
-    typeof (value as ProcessEvidence).observe !== "function" ||
-    typeof (value as ProcessEvidence).inspectProcessGroup !== "function"
+    !isProcessEvidencePlatform((value as ProcessEvidence<TProcessIdentity>).platform) ||
+    typeof (value as ProcessEvidence<TProcessIdentity>).capture !== "function" ||
+    typeof (value as ProcessEvidence<TProcessIdentity>).observe !== "function" ||
+    typeof (value as ProcessEvidence<TProcessIdentity>).inspectProcessGroup !== "function"
   ) {
     throw new ProcessEvidenceError("process evidence adapter is invalid");
   }
-  return value as ProcessEvidence;
+  return value as ProcessEvidence<TProcessIdentity>;
 }
 
 function nativeLinuxProcessIds(): readonly number[] {

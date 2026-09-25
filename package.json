@@ -45,7 +45,8 @@
     "package.json"
   ],
   "scripts": {
-    "build": "node scripts/clean-dist.mjs && tsc",
+    "build": "node scripts/clean-dist.mjs && tsc && npm run build:native",
+    "build:native": "node scripts/build-darwin-process-evidence.mjs",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "npm run typecheck && npm run build && vitest run",
     "validate:architecture": "node scripts/verify-import-boundaries.mjs",
@@ -60,6 +61,7 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^26.1.1",
+    "node-gyp": "^11.5.0",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   },
