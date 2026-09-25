@@ -244,6 +244,24 @@ npm ci
 npm run validate
 ```
 
+On macOS, contributors can build and test the source fallback with the Xcode
+Command Line Tools installed:
+
+```bash
+npm run build:native
+npm run test:native:source
+```
+
+The source fallback is written to ignored `build/Release/`; installed packages
+use the reviewed `prebuilds/darwin-arm64` or `prebuilds/darwin-x64` Node-API
+artifact selected from the host. Maintainers can regenerate either reviewed
+artifact with `npm run build:native:prebuild:arm64` or
+`npm run build:native:prebuild:x64`. An Apple Silicon host can cross-compile the
+x64 artifact, but executing its native contract requires an Intel Mac or x64
+Rosetta environment. The installed-package test accepts a JSON array in
+`PASEO_AGY_ACP_TEST_NODE_EXECUTABLES`; when set, it requires both Node major 22
+and Node major 24 to load the same host-matching prebuild.
+
 An official-kernel smoke additionally requires
 `PASEO_AGY_ACP_OFFICIAL_BIN`:
 
