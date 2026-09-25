@@ -10,6 +10,15 @@ import {
   type AdmissionPolicy
 } from "../Admission Controller/controller.js";
 import {
+  parsePlatformProcessIdentity,
+  serializePlatformProcessIdentity,
+  type PlatformProcessIdentity
+} from "../Admission Controller/canonical-process-identity.js";
+import {
+  DARWIN_PROCESS_EVIDENCE_FORMAT_VERSION,
+  type DarwinProcessIdentity
+} from "../Admission Controller/darwin-process-evidence.js";
+import {
   parseProcessIdentity,
   serializeProcessIdentity,
   type ProcessEvidence,
@@ -54,8 +63,21 @@ function identity(pid: number): ProcessIdentity {
   };
 }
 
-function processEvidence(platform: ProcessEvidencePlatform = "linux"): ProcessEvidence {
-  const current = identity(process.pid);
+function darwinIdentity(pid: number): DarwinProcessIdentity {
+  return {
+    platform: "darwin",
+    formatVersion: DARWIN_PROCESS_EVIDENCE_FORMAT_VERSION,
+    bootSessionToken: "1800000000000000000",
+    pid,
+    processStartMicros: String(100 + pid),
+    ppid: 1,
+    pgrp: pid,
+    session: pid
+  };
+}
+
+function processEvidence(platform: ProcessEvidencePlatform = "linux"): ProcessEvidence<PlatformProcessIdentity> {
+  const current: PlatformProcessIdentity = platform === "darwin" ? darwinIdentity(process.pid) : identity(process.pid);
   return {
     platform,
     capture: () => current,
@@ -323,11 +345,14 @@ afterEach(() => {
 describe("canonical platform-tagged process evidence and schema v4", () => {
   it("serializes and parses only canonical evidence for the selected platform", () => {
     const linux = identity(4182);
+    const darwin = darwinIdentity(4182);
     const encoded = serializeProcessIdentity(linux, "linux");
+    const darwinEncoded = serializePlatformProcessIdentity(darwin, "darwin");
     expect(parseProcessIdentity(encoded, "linux")).toEqual(linux);
-    expect(parseProcessIdentity(encoded, "darwin")).toBeNull();
+    expect(parsePlatformProcessIdentity(encoded, "darwin")).toBeNull();
     expect(parseProcessIdentity(JSON.stringify({ ...JSON.parse(encoded), extra: true }), "linux")).toBeNull();
-    expect(parseProcessIdentity(serializeProcessIdentity(linux, "darwin"), "linux")).toBeNull();
+    expect(parsePlatformProcessIdentity(darwinEncoded, "linux")).toBeNull();
+    expect(parsePlatformProcessIdentity(darwinEncoded, "darwin")).toEqual(darwin);
     expect(parseProcessIdentity('{"platform":"linux"}', "linux")).toBeNull();
   });
 
@@ -335,6 +360,7 @@ describe("canonical platform-tagged process evidence and schema v4", () => {
     const file = databasePath();
     const admission = openController(file, "darwin");
     try {
+      expect(() => admission.processEvidence).toThrow(/Linux compatibility accessor/i);
       admission.claimDurablePolicy(POLICY, OWNER_ID, 1_000);
       admission.enqueue({
         requestId: "fresh-v4-request",
@@ -354,7 +380,7 @@ describe("canonical platform-tagged process evidence and schema v4", () => {
       expect(ledger(file)).toEqual([{ version: 4, name: "shared-admission-queue-v4" }]);
       expect(db.prepare("SELECT process_evidence_platform FROM policy_state").get()).toEqual({ process_evidence_platform: "darwin" });
       const row = db.prepare("SELECT queued_owner_evidence_json AS evidence FROM queued_owner_instances").get() as { evidence: string };
-      expect(parseProcessIdentity(row.evidence, "darwin")).toEqual(identity(process.pid));
+      expect(parsePlatformProcessIdentity(row.evidence, "darwin")).toEqual(darwinIdentity(process.pid));
     } finally {
       db.close();
     }
@@ -463,13 +489,13 @@ describe("canonical platform-tagged process evidence and schema v4", () => {
          SET connector_evidence_json = ?, child_evidence_json = ?
          WHERE lease_id = ?`
       ).run(
-        serializeProcessIdentity(identity(3711), "darwin"),
-        serializeProcessIdentity(identity(4182), "darwin"),
+        serializePlatformProcessIdentity(darwinIdentity(3711), "darwin"),
+        serializePlatformProcessIdentity(darwinIdentity(4182), "darwin"),
         LEASE_ID
       );
       expect(() => assertAdmissionSchemaIntegrity(db)).toThrow(SchemaIntegrityError);
       expect(() => assertAdmissionSchemaIntegrity(db)).toThrow(/platform does not match/i);
-      expect(row.evidence).not.toBe(serializeProcessIdentity(identity(4182), "darwin"));
+      expect(row.evidence).not.toBe(serializePlatformProcessIdentity(darwinIdentity(4182), "darwin"));
     } finally {
       db.close();
     }
