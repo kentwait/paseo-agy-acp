@@ -15,10 +15,12 @@ const DEFAULT_IGNORED_PATH_PREFIXES = [
 ];
 
 const TEXT_EXTENSIONS = new Set([
+  ".cc",
   ".cjs",
   ".css",
   ".env",
   ".example",
+  ".gyp",
   ".html",
   ".js",
   ".json",
