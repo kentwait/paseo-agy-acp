@@ -25,6 +25,13 @@ function markdownTargets(markdown: string): string[] {
   return [...markdown.matchAll(/\[[^\]]+\]\(([^)]+)\)/g)].map((match) => match[1]);
 }
 
+function executableBlocks(markdown: string): Array<{ language: string; body: string }> {
+  return [...markdown.matchAll(/```(bash|json)\n([\s\S]*?)```/g)].map((match) => ({
+    language: match[1],
+    body: match[2]
+  }));
+}
+
 describe("v2.0.0.0 closeout documentation contract", () => {
   it("keeps product READMEs current, bilingual, and separate from release history", () => {
     const failures: string[] = [];
@@ -44,16 +51,29 @@ describe("v2.0.0.0 closeout documentation contract", () => {
       "./README.zh-CN.md",
       "./CHANGELOG.md",
       "docs/operations/admission.md",
+      "docs/operations/admission.zh-CN.md",
       "docs/operations/official-kernel-compat-runbook.md",
       "docs/operations/npm-publishing.md"
     ];
 
     const readmes = [
-      ["README.md", readDoc("README.md")],
-      ["README.zh-CN.md", readDoc("README.zh-CN.md")]
+      [
+        "README.md",
+        readDoc("README.md"),
+        "Admission is supported on Linux and macOS `arm64` and `x64` hosts.",
+        /Admission\s+remains disabled by default[.;]/,
+        "Linux-only official-kernel compatibility lifecycle"
+      ],
+      [
+        "README.zh-CN.md",
+        readDoc("README.zh-CN.md"),
+        "Admission 支持 Linux，以及 macOS `arm64` 和 `x64` 主机。",
+        /Admission\s+默认保持禁用[。；]/,
+        "仅限 Linux 的官方内核兼容生命周期"
+      ]
     ] as const;
 
-    for (const [label, contents] of readmes) {
+    for (const [label, contents, supportedPlatforms, defaultDisabled, compatibilityLifecycle] of readmes) {
       const links = markdownTargets(contents);
       for (const target of requiredTargets) {
         if (!links.includes(target)) {
@@ -72,6 +92,23 @@ describe("v2.0.0.0 closeout documentation contract", () => {
       }
       if (/\/home\/tiezbro\//.test(contents)) {
         failures.push(`${label} contains a maintainer-local absolute path`);
+      }
+      for (const staleRequirement of [
+        "Linux filesystem ownership and mode support when Admission is enabled",
+        "启用 Admission 时，系统需支持 Linux 文件 owner 与 mode"
+      ]) {
+        if (contents.includes(staleRequirement)) {
+          failures.push(`${label} keeps stale platform requirement ${staleRequirement}`);
+        }
+      }
+      if (!contents.includes(supportedPlatforms)) {
+        failures.push(`${label} does not state the supported Admission platforms and architectures`);
+      }
+      if (!defaultDisabled.test(contents)) {
+        failures.push(`${label} does not preserve default-disabled Admission behavior`);
+      }
+      if (!contents.includes(compatibilityLifecycle)) {
+        failures.push(`${label} does not keep the compatibility lifecycle Linux-specific`);
       }
       if (/\b2\.(?:0|1|2)(?:\.\d+){1,2}\b/.test(contents)) {
         failures.push(`${label} contains historical release narration`);
@@ -94,13 +131,89 @@ describe("v2.0.0.0 closeout documentation contract", () => {
       failures.push("English and Chinese README link targets differ");
     }
 
-    const executableBlocks = (markdown: string) =>
-      [...markdown.matchAll(/```(bash|json)\n([\s\S]*?)```/g)].map((match) => ({
-        language: match[1],
-        body: match[2]
-      }));
     if (JSON.stringify(executableBlocks(english)) !== JSON.stringify(executableBlocks(chinese))) {
       failures.push("English and Chinese README executable examples differ");
+    }
+
+    expect(failures).toEqual([]);
+  });
+
+  it("keeps bilingual macOS Admission operations guidance aligned and bounded", () => {
+    const english = readDoc("docs/operations/admission.md");
+    const chinese = readDoc("docs/operations/admission.zh-CN.md");
+    const failures: string[] = [];
+
+    if (JSON.stringify(executableBlocks(english)) !== JSON.stringify(executableBlocks(chinese))) {
+      failures.push("English and Chinese Admission executable examples differ");
+    }
+
+    for (const requiredLiteral of [
+      "Linux",
+      "macOS",
+      "arm64",
+      "x64",
+      "AGY_ACP_ADMISSION_ENABLED",
+      "AGY_ACP_STATE_DIR",
+      "PASEO_AGENT_ID",
+      "official-kernel",
+      "0700",
+      "0600",
+      "stat -c '%U %a %n'",
+      "stat -f '%Su %Lp %N'",
+      "sudo chown \"$(id -un)\"",
+      "chmod 700",
+      "prebuilds/darwin-arm64/darwin_process_evidence.node",
+      "prebuilds/darwin-x64/darwin_process_evidence.node",
+      "build/Release/",
+      "npm run build:native",
+      "npm run test:native:source",
+      "cancelled",
+      "recovery_required",
+      "unverifiable"
+    ]) {
+      for (const [label, contents] of [["English guide", english], ["Chinese guide", chinese]] as const) {
+        if (!contents.includes(requiredLiteral)) {
+          failures.push(`${label} lacks Admission operations literal ${requiredLiteral}`);
+        }
+      }
+    }
+
+    const semanticPatterns = [
+      [/Admission\s+remains disabled by default[.;]/, /Admission\s+默认保持禁用[。；]/],
+      [/Linux and macOS.*`arm64` and `x64`/, /Linux.*macOS.*`arm64`.*`x64`/],
+      [/fresh.*account state root/is, /全新.*账号状态根/is],
+      [/host-local and platform-bound/i, /宿主机本地.*绑定平台/is],
+      [/never copy[\s\S]*another machine/is, /不要[\s\S]*复制/],
+      [/nested `official-kernel` ledger/i, /嵌套.*`official-kernel`.*ledger/is],
+      [/nested[\s\S]*directory.*`0700`/is, /嵌套.*目录.*`0700`/is],
+      [/state files.*`0600`/is, /状态文件.*`0600`/is],
+      [/Discovery.*does not.*Admission ledger/is, /Discovery.*不会.*Admission ledger/is],
+      [/--login.*does not.*Admission/is, /--login.*不会.*Admission/is],
+      [/Other operating systems.*fail closed/is, /其他操作系统.*fail closed/is],
+      [/Policy mismatch/, /Policy mismatch/],
+      [/Malformed.*evidence.*fail closed/is, /损坏.*证据.*fail closed/is],
+      [/Queued-owner cancellation/, /queued-owner.*取消|排队 owner.*取消/is],
+      [/Local seat release/, /本机.*席位.*释放/is],
+      [/No-replay guarantee/, /不重放.*保证|永不重放/is],
+      [/source-build fallback/, /源码构建回退/],
+      [/expected platform.*actual platform/is, /expected platform.*actual\s+platform/is]
+    ] as const;
+
+    for (const [englishPattern, chinesePattern] of semanticPatterns) {
+      if (!englishPattern.test(english)) {
+        failures.push(`English Admission guide lacks semantic pattern ${englishPattern}`);
+      }
+      if (!chinesePattern.test(chinese)) {
+        failures.push(`Chinese Admission guide lacks semantic pattern ${chinesePattern}`);
+      }
+    }
+
+    const compatibilityRunbook = readDoc("docs/operations/official-kernel-compat-runbook.md");
+    if (!/This lifecycle is strictly Linux-only\b/i.test(compatibilityRunbook)) {
+      failures.push("official-kernel compatibility runbook does not declare its Linux-only boundary");
+    }
+    if (!/separate from macOS Admission support/i.test(compatibilityRunbook)) {
+      failures.push("official-kernel compatibility runbook does not separate its lifecycle from macOS Admission");
     }
 
     expect(failures).toEqual([]);

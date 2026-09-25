@@ -3,6 +3,8 @@
 ## Overview
 This runbook provides precise operations for applying the local-only RC01 compatibility layer for the official Antigravity ACP kernel. This lifecycle enables discovering and operating non-Gemini models (e.g., Claude 4.6, GPT-OSS 120B) via precise local request compatibility transforms, without redistributing Google proprietary artifacts or overriding upstream backend controls.
 
+This lifecycle is strictly Linux-only and also requires a non-root POSIX user identity. It is separate from macOS Admission support: macOS Admission uses Darwin process evidence but does not enable these compatibility commands or the `--uid=` launch behavior.
+
 > [!WARNING]
 > **Boundary & ToS**: This is an explicitly **opt-in**, **local-only** operation applied by the host operator. It is **not** an official Google fix or distribution. Neither modified binaries nor runfiles may be uploaded, published, or distributed.
 
