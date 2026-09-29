@@ -1,6 +1,6 @@
 # Git authorship — hard rule
 
-This repository’s GitHub **Contributors** graph must list **only** the human maintainer (`tiezbro`). Cursor / Cursor Agent / `cursoragent` is **never** a contributor.
+This repository is a fork of `tiezbro/paseo-agy-acp`. Its GitHub **Contributors** graph must list **only** the human maintainer of this fork (`kentwait`, `kentkawashima@gmail.com`). Cursor / Cursor Agent / `cursoragent` is **never** a contributor.
 
 Cursor’s `git commit` wrapper appends this trailer even when the agent did not ask for it:
 
@@ -47,13 +47,13 @@ If GitHub’s **Contributors** sidebar still shows `cursoragent` after the trail
 4. `gh repo edit --default-branch main`
 5. Delete `flush-contributors`.
 6. Re-run `gh repo edit --description "..."` (About is metadata; this switch must not leave the old blurb).
-7. Confirm `mentionableUsers` is only `tiezbro` and the live HTML has zero `cursoragent`.
+7. Confirm `mentionableUsers` is only `kentwait` and the live HTML has zero `cursoragent`.
 
 Do not use a visibility toggle.
 
 ## Push
 
-The writable primary is GitHub `origin` (`https://github.com/tiezbro/paseo-agy-acp.git`). Forgejo (`ssh://git@192.168.6.10:222/tiezbro/paseo-agy-acp.git`) is a read-only **pull mirror**. A `main` push to `origin` runs GitHub Action **Sync Forgejo mirror**, which asks Forgejo to pull.
+The writable primary is GitHub `origin` (`https://github.com/kentwait/paseo-agy-acp.git`). Forgejo (`ssh://git@192.168.6.10:222/kentwait/paseo-agy-acp.git`) is a read-only **pull mirror**. A `main` push to `origin` runs GitHub Action **Sync Forgejo mirror**, which asks Forgejo to pull.
 
 Push `origin`. Do not push `forgejo` — the mirror rejects writes.
 
@@ -66,7 +66,7 @@ git push origin main
 README is not the GitHub **About** blurb. That lives in repo metadata and is updated with:
 
 ```bash
-gh repo edit tiezbro/paseo-agy-acp --description "..."
+gh repo edit kentwait/paseo-agy-acp --description "..."
 ```
 
 Keep it aligned with the README subtitle: official ACP kernel, Paseo-ready product adapter, NDJSON proxy, daemon context, Admission queue. Do **not** write “not a scraper” or “not a shindgew fork” there. Changing README does not change About.

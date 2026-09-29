@@ -4,15 +4,15 @@ import {
   type AdmissionLease,
   type AdmissionQueueSnapshot,
   type LiveTurnCompletion,
-  type VerifiedLinuxProcessRecord
+  type VerifiedProcessRecord
 } from "../../Admission Controller/controller.js";
 import {
-  captureLinuxProcessIdentity,
-  nativeLinuxProcessEvidenceReaders
+  requireProcessEvidence,
+  type ProcessEvidence
 } from "../../Admission Controller/process-evidence.js";
 import {
-  captureLinuxConnectorOwnerIdentity,
-  type LinuxConnectorOwnerIdentity
+  captureConnectorOwnerIdentity,
+  type ConnectorOwnerIdentity
 } from "./owner-instance.js";
 import { classifyProviderFailure } from "./errors.js";
 import {
@@ -54,6 +54,7 @@ export interface AdmissionTurnCoordinatorOptions {
   readonly agentId?: string;
   readonly parentId?: string;
   readonly connectorPid?: number;
+  readonly processEvidence?: ProcessEvidence;
   readonly now?: () => number;
   readonly createRequestId?: () => string;
   readonly queuePollIntervalMs?: number;
@@ -83,7 +84,8 @@ export class AdmissionTurnRecoveryRequiredError extends Error {
 export class AdmissionTurnCoordinator {
   readonly #controller: AdmissionController;
   readonly #agentId: string;
-  readonly #ownerIdentity: LinuxConnectorOwnerIdentity;
+  readonly #ownerIdentity: ConnectorOwnerIdentity;
+  readonly #processEvidence: ProcessEvidence;
   readonly #now: () => number;
   readonly #createRequestId: () => string;
   readonly #queuePollIntervalMs: number;
@@ -95,6 +97,10 @@ export class AdmissionTurnCoordinator {
   constructor(options: AdmissionTurnCoordinatorOptions) {
     this.#controller = options.controller;
     this.#agentId = optionAgentId(options);
+    this.#processEvidence = requireProcessEvidence(options.processEvidence ?? options.controller.processEvidence);
+    if (this.#processEvidence.platform !== options.controller.processEvidence.platform) {
+      throw new Error("process evidence platform does not match durable admission platform");
+    }
     this.#now = options.now ?? Date.now;
     this.#createRequestId = options.createRequestId ?? randomUUID;
     this.#queuePollIntervalMs = positiveInterval(
@@ -113,14 +119,18 @@ export class AdmissionTurnCoordinator {
       "heartbeat interval"
     );
     this.#wait = options.wait ?? waitForAbort;
-    this.#ownerIdentity = captureLinuxConnectorOwnerIdentity(
+    this.#ownerIdentity = captureConnectorOwnerIdentity(
       options.connectorPid ?? process.pid,
-      nativeLinuxProcessEvidenceReaders
+      this.#processEvidence
     );
   }
 
-  get ownerIdentity(): LinuxConnectorOwnerIdentity {
+  get ownerIdentity(): ConnectorOwnerIdentity {
     return this.#ownerIdentity;
+  }
+
+  get processEvidence(): ProcessEvidence {
+    return this.#processEvidence;
   }
 
   async admit(input: AdmissionTurnInput): Promise<"end_turn" | "cancelled"> {
@@ -150,6 +160,7 @@ export class AdmissionTurnCoordinator {
       this.#controller,
       lease,
       this.#ownerIdentity,
+      this.#processEvidence,
       input.claim,
       this.#now
     );
@@ -312,23 +323,26 @@ class TurnDispatchBoundary implements AgyAdmissionDispatchBoundary {
   readonly claim: TurnClaim;
   readonly #controller: AdmissionController;
   readonly #lease: AdmissionLease;
-  readonly #ownerIdentity: LinuxConnectorOwnerIdentity;
+  readonly #ownerIdentity: ConnectorOwnerIdentity;
+  readonly #processEvidence: ProcessEvidence;
   readonly #now: () => number;
   #prepared = false;
   #promptWriteIssued = false;
   #active = false;
-  #record: VerifiedLinuxProcessRecord | undefined;
+  #record: VerifiedProcessRecord | undefined;
 
   constructor(
     controller: AdmissionController,
     lease: AdmissionLease,
-    ownerIdentity: LinuxConnectorOwnerIdentity,
+    ownerIdentity: ConnectorOwnerIdentity,
+    processEvidence: ProcessEvidence,
     claim: TurnClaim,
     now: () => number
   ) {
     this.#controller = controller;
     this.#lease = lease;
     this.#ownerIdentity = ownerIdentity;
+    this.#processEvidence = processEvidence;
     this.claim = claim;
     this.#now = now;
   }
@@ -352,8 +366,8 @@ class TurnDispatchBoundary implements AgyAdmissionDispatchBoundary {
   private prepareProcess(processId: number, promptChannel: "stdin" | "pty"): void {
     if (this.#prepared) throw new Error("admission process boundary was already prepared");
     this.claim.throwIfAborted();
-    const child = captureLinuxProcessIdentity(processId, nativeLinuxProcessEvidenceReaders);
-    const record = Object.freeze({
+    const child = this.#processEvidence.capture(processId);
+    const record: VerifiedProcessRecord = Object.freeze({
       requestId: this.#lease.requestId,
       leaseId: this.#lease.leaseId,
       generation: this.#lease.generation,

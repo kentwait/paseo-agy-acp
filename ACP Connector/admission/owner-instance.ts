@@ -1,24 +1,29 @@
 import { randomUUID } from "node:crypto";
 import {
-  captureLinuxProcessIdentity,
-  isSameLinuxProcessIdentity,
-  observeLinuxProcessIdentity,
+  createLinuxProcessEvidence,
+  isSameProcessIdentity,
+  requireProcessEvidence,
   type LinuxProcessEvidenceReaders,
-  type LinuxProcessIdentity,
-  type LinuxProcessIdentityState
+  type ProcessEvidence,
+  type ProcessIdentity,
+  type ProcessIdentityState
 } from "../../Admission Controller/process-evidence.js";
 
 const OWNER_INSTANCE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const ISO_UTC_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
-/** A connector-local owner token paired with immutable Linux process evidence. */
-export interface LinuxConnectorOwnerIdentity extends LinuxProcessIdentity {
+/** A connector-local owner token paired with immutable process evidence. */
+export interface ConnectorOwnerIdentity extends ProcessIdentity {
   readonly ownerInstanceId: string;
   readonly createdAt: string;
 }
 
+export type LinuxConnectorOwnerIdentity = ConnectorOwnerIdentity;
+
 /** Conservative result of checking a persisted connector owner record. */
-export type LinuxConnectorOwnerIdentityState = LinuxProcessIdentityState;
+export type ConnectorOwnerIdentityState = ProcessIdentityState;
+
+export type LinuxConnectorOwnerIdentityState = ConnectorOwnerIdentityState;
 
 /** Injectable nondeterministic dependencies keep tests away from runtime state and real processes. */
 export interface OwnerInstanceDependencies {
@@ -35,16 +40,18 @@ export class ConnectorOwnerIdentityError extends Error {
 
 /**
  * Capture the current connector owner record without persisting it. Callers
- * must supply process-evidence readers explicitly so the boundary is visible.
+ * must supply the selected process-evidence adapter explicitly so the
+ * boundary is visible.
  */
-export function captureLinuxConnectorOwnerIdentity(
+export function captureConnectorOwnerIdentity(
   pid: number,
-  readers: LinuxProcessEvidenceReaders,
+  processEvidence: ProcessEvidence,
   dependencies: OwnerInstanceDependencies = {}
-): LinuxConnectorOwnerIdentity {
+): ConnectorOwnerIdentity {
+  const evidence = requireProcessEvidence(processEvidence);
   const ownerInstanceId = createOwnerInstanceId(dependencies.createOwnerInstanceId ?? randomUUID);
   const createdAt = captureTimestamp(dependencies.now ?? (() => new Date()));
-  const processIdentity = captureLinuxProcessIdentity(pid, readers);
+  const processIdentity = evidence.capture(pid);
 
   return Object.freeze({
     ownerInstanceId,
@@ -57,23 +64,46 @@ export function captureLinuxConnectorOwnerIdentity(
  * Re-observe the persisted record's PID and return false for every malformed,
  * unavailable, or mismatched condition. It never reads or writes runtime files.
  */
-export function verifyPersistedLinuxConnectorOwnerIdentity(
+export function verifyPersistedConnectorOwnerIdentity(
   persisted: unknown,
-  readers: LinuxProcessEvidenceReaders
+  processEvidence: ProcessEvidence
 ): boolean {
-  return observePersistedLinuxConnectorOwnerIdentity(persisted, readers) === "same";
+  return observePersistedConnectorOwnerIdentity(persisted, processEvidence) === "same";
 }
 
 /**
  * Re-observe a persisted connector owner without treating PID existence as
- * ownership. Malformed owner records and unreadable procfs both fail closed.
+ * ownership. Malformed owner records and unreadable process evidence both fail
+ * closed.
  */
+export function observePersistedConnectorOwnerIdentity(
+  persisted: unknown,
+  processEvidence: ProcessEvidence
+): ConnectorOwnerIdentityState {
+  const expected = normalizePersistedOwnerIdentity(persisted);
+  return expected === null ? "unverifiable" : requireProcessEvidence(processEvidence).observe(expected);
+}
+
+export function captureLinuxConnectorOwnerIdentity(
+  pid: number,
+  readers: LinuxProcessEvidenceReaders,
+  dependencies: OwnerInstanceDependencies = {}
+): ConnectorOwnerIdentity {
+  return captureConnectorOwnerIdentity(pid, createLinuxProcessEvidence({ readers }), dependencies);
+}
+
+export function verifyPersistedLinuxConnectorOwnerIdentity(
+  persisted: unknown,
+  readers: LinuxProcessEvidenceReaders
+): boolean {
+  return verifyPersistedConnectorOwnerIdentity(persisted, createLinuxProcessEvidence({ readers }));
+}
+
 export function observePersistedLinuxConnectorOwnerIdentity(
   persisted: unknown,
   readers: LinuxProcessEvidenceReaders
-): LinuxConnectorOwnerIdentityState {
-  const expected = normalizePersistedOwnerIdentity(persisted);
-  return expected === null ? "unverifiable" : observeLinuxProcessIdentity(expected, readers);
+): ConnectorOwnerIdentityState {
+  return observePersistedConnectorOwnerIdentity(persisted, createLinuxProcessEvidence({ readers }));
 }
 
 function createOwnerInstanceId(factory: () => string): string {
@@ -97,7 +127,7 @@ function captureTimestamp(now: () => Date): string {
   return requireTimestamp(value, "creation timestamp");
 }
 
-function normalizePersistedOwnerIdentity(value: unknown): LinuxConnectorOwnerIdentity | null {
+function normalizePersistedOwnerIdentity(value: unknown): ConnectorOwnerIdentity | null {
   if (!isRecord(value)) return null;
 
   try {
@@ -109,8 +139,8 @@ function normalizePersistedOwnerIdentity(value: unknown): LinuxConnectorOwnerIde
       ppid: value.ppid,
       pgrp: value.pgrp,
       session: value.session
-    } as LinuxProcessIdentity;
-    if (!isSameLinuxProcessIdentity(processIdentity, processIdentity)) return null;
+    } as ProcessIdentity;
+    if (!isSameProcessIdentity(processIdentity, processIdentity)) return null;
 
     return Object.freeze({
       ownerInstanceId: requireOwnerInstanceId(value.ownerInstanceId),

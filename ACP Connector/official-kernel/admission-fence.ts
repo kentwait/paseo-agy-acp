@@ -22,14 +22,12 @@ export function issueAdmittedOfficialPromptWrite(
   write: () => void
 ): void {
   boundary.prepare(processId);
-  const intent = boundary as AgyAdmissionDispatchBoundary & { commitDispatchIntent?: () => void };
-  intent.commitDispatchIntent?.();
+  boundary.commitDispatchIntent();
   boundary.beforePromptWrite();
   try {
     write();
   } catch (error) {
-    const ambiguous = boundary as AgyAdmissionDispatchBoundary & { markDispatchAmbiguous?: () => void };
-    ambiguous.markDispatchAmbiguous?.();
+    boundary.markDispatchAmbiguous();
     throw error;
   }
   boundary.afterPromptWrite();
@@ -55,7 +53,8 @@ export function createOfficialAdmission(
     runtime,
     coordinator: new AdmissionTurnCoordinator({
       controller: runtime.controller,
-      agentId: isolated.PASEO_AGENT_ID
+      agentId: isolated.PASEO_AGENT_ID,
+      processEvidence: runtime.processEvidence
     })
   };
 }

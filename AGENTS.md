@@ -2,7 +2,7 @@
 
 **Read [agent.md](./agent.md) before every `git commit` and `git push`.** GitHub **About** is `gh repo edit --description`, not README.
 
-Commits are authored only by the human maintainer (`tiezbro`). After `git commit`, run `git log -1 --format=%B`. If you see `Co-authored-by: Cursor` or `cursoragent@cursor.com`, do **not** push — strip the trailer with `git commit-tree` as in `agent.md`. Never toggle GitHub public/private to hide a contributor (that deletes stars and forks). Push `origin` (GitHub). Forgejo is the read-only pull mirror; details in [agent.md](./agent.md).
+Commits are authored only by the human maintainer (`kentwait`, `kentkawashima@gmail.com`). This repository is a fork of `tiezbro/paseo-agy-acp`; upstream authorship rules do not apply here. After `git commit`, run `git log -1 --format=%B`. If you see `Co-authored-by: Cursor` or `cursoragent@cursor.com`, do **not** push — strip the trailer with `git commit-tree` as in `agent.md`. Never toggle GitHub public/private to hide a contributor (that deletes stars and forks). Push `origin` (GitHub). Forgejo is the read-only pull mirror; details in [agent.md](./agent.md).
 
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
